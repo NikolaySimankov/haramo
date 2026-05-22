@@ -20,6 +20,10 @@ from sklearn.metrics import (
     confusion_matrix,
     cohen_kappa_score,
     matthews_corrcoef,
+    average_precision_score,
+    roc_auc_score,
+    make_scorer,
+    get_scorer,
 )
 
 import matplotlib.pyplot as plt
@@ -128,19 +132,50 @@ def biserial_scorer(X, y):
     return (scores, pvalue)
 
 
-def classification_report(true_value, predicted_value):
+mcc_scorer = make_scorer(matthews_corrcoef)
+
+# PR-AUC (Average Precision) is better adapted to imbalanced binary than
+# ROC-AUC because it focuses on the positive class. needs_proba=True so
+# sklearn forwards predict_proba/decision_function to the metric.
+pr_auc_scorer = make_scorer(average_precision_score, needs_proba=True)
+
+roc_auc_scorer = make_scorer(roc_auc_score, needs_proba=True)
+
+
+_INTERNAL_SCORERS = {
+    "MCC": mcc_scorer,
+    "PR AUC": pr_auc_scorer,
+    "ROC AUC": roc_auc_scorer,
+}
+
+
+def resolve_scorer(scoring):
+    """Resolve a scoring argument to a sklearn-compatible scorer callable.
+
+    Accepts an internal alias ("MCC", "PR AUC", "ROC AUC"), any
+    string supported by sklearn's ``get_scorer``, or a callable
+    (returned as-is).
     """
+    if callable(scoring):
+        return scoring
+    if scoring in _INTERNAL_SCORERS:
+        return _INTERNAL_SCORERS[scoring]
+    return get_scorer(scoring)
+
+
+def classification_report(true_value, predicted_value, y_score=None):
+    """Compute classification metrics for a binary problem.
 
     Parameters
     ----------
-    true_value : TYPE
-        DESCRIPTION.
-    predicted_value : TYPE
-        DESCRIPTION.
-    Returns
-    -------
-    table : TYPE
-        DESCRIPTION.
+    true_value : array-like
+        Ground-truth labels.
+    predicted_value : array-like
+        Predicted labels.
+    y_score : array-like, optional
+        Positive-class score (probability or decision function). Required
+        for PR AUC and ROC AUC; when omitted those entries are NaN so the
+        resulting Series shape stays stable.
     """
     table = {}
 
@@ -182,6 +217,13 @@ def classification_report(true_value, predicted_value):
         pos_label=0,
         average="binary",
     )
+
+    if y_score is not None and not pd.isna(np.asarray(y_score, dtype=float)).all():
+        table["PR AUC"] = average_precision_score(true_value, y_score)
+        table["ROC AUC"] = roc_auc_score(true_value, y_score)
+    else:
+        table["PR AUC"] = float("nan")
+        table["ROC AUC"] = float("nan")
 
     return pd.Series(table)
 

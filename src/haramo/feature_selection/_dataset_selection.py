@@ -12,11 +12,9 @@ import pandas as pd
 
 from joblib import Parallel, delayed
 from sklearn.base import clone
-from sklearn.metrics import get_scorer
 from sklearn.model_selection import StratifiedGroupKFold, StratifiedKFold
 from sklearn.svm import SVC
-from ..utils import reduce_dataset
-
+from ..utils import reduce_dataset, resolve_scorer
 
 #############
 # Functions #
@@ -73,10 +71,7 @@ def _score_dataset_combo(
     """
     pipeline = _build_default_pipeline(task, random_state)
 
-    if isinstance(scoring, str):
-        scorer = get_scorer(scoring)
-    else:
-        scorer = scoring
+    scorer = resolve_scorer(scoring)
 
     if inner_cv_groups is not None:
         cv = StratifiedGroupKFold(n_splits=4)
@@ -115,7 +110,7 @@ def _score_dataset_combo(
 def select_best_dataset_combo(
     datasets: Dict[str, pd.DataFrame],
     y: pd.Series,
-    scoring: Union[str, Callable] = "balanced_accuracy",
+    scoring: Union[str, Callable] = "PR AUC",
     task: str = "classification",
     random_state: int = 42,
     inner_cv_groups=None,
@@ -147,7 +142,9 @@ def select_best_dataset_combo(
         index as ``y``.
     y : pd.Series
         Target vector.
-    scoring : str or callable, default ``"balanced_accuracy"``
+    scoring : str or callable, default ``"PR AUC"``
+        Internal aliases:  ``"PR AUC"``, ``"ROC AUC"``,
+        ``"MCC"``. Any sklearn scorer string or callable is also accepted.
     task : str, default ``"classification"``
     random_state : int, default 42
     inner_cv_groups : array-like, optional
@@ -172,7 +169,9 @@ def select_best_dataset_combo(
 
     def _score_one(combo: tuple) -> tuple:
         X_combo = pd.concat([datasets[name] for name in combo], axis=1)
-        score = _score_dataset_combo(X_combo, y, scoring, task, random_state, inner_cv_groups)
+        score = _score_dataset_combo(
+            X_combo, y, scoring, task, random_state, inner_cv_groups
+        )
         return combo, score
 
     # ------------------------------------------------------------------ #

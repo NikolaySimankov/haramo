@@ -10,10 +10,9 @@ import numpy as np
 import pandas as pd
 
 from sklearn.base import clone
-from sklearn.metrics import get_scorer
 from sklearn.model_selection import StratifiedKFold, StratifiedGroupKFold
 from sklearn.pipeline import Pipeline
-from ..utils import reduce_dataset
+from ..utils import reduce_dataset, resolve_scorer
 
 from optuna import create_study
 from optuna.samplers import TPESampler
@@ -100,10 +99,7 @@ def _fs_objective(
         feature_selector_pipeline.steps + [("scaler", scaler), ("model", model)]
     )
 
-    if isinstance(scoring, str):
-        scorer = get_scorer(scoring)
-    else:
-        scorer = scoring
+    scorer = resolve_scorer(scoring)
 
     if inner_splits is not None:
         splits = inner_splits
@@ -154,7 +150,7 @@ def select_best_feature_selector(
     y_train: pd.Series,
     feature_selector,
     task: str = "classification",
-    scoring: Union[str, Callable] = "balanced_accuracy",
+    scoring: Union[str, Callable] = "AUC",
     random_state: int = 42,
     inner_cv_groups=None,
     n_jobs: int = 1,
@@ -180,8 +176,10 @@ def select_best_feature_selector(
         Same argument accepted by ``instantiate_feature_selector``.
     task : str
         ``"classification"`` or ``"regression"``.
-    scoring : str or callable
-        Scorer for the inner 3-fold CV.
+    scoring : str or callable, default ``"AUC"``
+        Scorer for the inner 3-fold CV. Internal aliases: ``"AUC"`` (PR-AUC),
+        ``"PR_AUC"``, ``"ROC_AUC"``, ``"MCC"``. Any sklearn scorer string or
+        callable is also accepted.
     random_state : int
     inner_cv_groups : array-like, optional
         Group labels for ``StratifiedGroupKFold`` in the inner CV.

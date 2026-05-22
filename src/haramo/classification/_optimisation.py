@@ -19,7 +19,6 @@ from sklearn.model_selection import (
     StratifiedKFold,
     StratifiedGroupKFold,
 )
-from sklearn.metrics import get_scorer
 from sklearn.svm import SVC
 
 from sklearn.pipeline import Pipeline
@@ -34,7 +33,7 @@ from optuna.pruners import SuccessiveHalvingPruner
 from optuna.samplers import GridSampler
 
 from ._instantiation import instantiate_pipeline
-from ..utils import classification_report, reduce_dataset
+from ..utils import classification_report, reduce_dataset, resolve_scorer
 from ..feature_selection import select_best_dataset_combo, select_best_feature_selector
 
 #############
@@ -55,10 +54,7 @@ def _score_fold(
 ):
     """Fit a cloned pipeline on one CV fold and return the score."""
     pipe = clone(pipeline)
-    if isinstance(scoring, str):
-        scorer = get_scorer(scoring)
-    else:
-        scorer = scoring
+    scorer = resolve_scorer(scoring)
 
     X_train, X_test = X.iloc[train_index], X.iloc[test_index]
     y_train, y_test = y.iloc[train_index], y.iloc[test_index]
@@ -616,7 +612,7 @@ def _train_fold_multi_alg(
 def train(
     X: Union[np.ndarray, pd.DataFrame],
     y: Union[np.ndarray, pd.Series, list],
-    scoring: Union[str, Callable] = "balanced_accuracy",
+    scoring: Union[str, Callable] = "PR AUC",
     task: str = "classification",
     feature_selector: Union[str, list] = "optimize",
     scaler: Union[str, list] = "optimize",
@@ -637,8 +633,10 @@ def train(
         Feature matrix. Can be a NumPy array or a pandas DataFrame.
     y : Union[np.ndarray, pd.Series, list],
         Target vector. Can be a NumPy array, pandas Series, or a list.
-    scoring : Union[str, Callable], default="balanced_accuracy"
+    scoring : Union[str, Callable], default="PR AUC"
         Scoring method to evaluate the predictions on the test set.
+        Internal aliases:  "PR AUC", "ROC AUC", "MCC". Any sklearn
+        scorer string or a callable is also accepted.
     task : str, default="classification"
         The type of task to perform. Currently supports "classification".
     feature_selector : Union[str, list], default="optimize"
@@ -766,9 +764,22 @@ def _fit_and_predict(
     except Exception:
         pipe.fit(X_train, y_train)
 
+    predicted = pipe.predict(X_test)
+
+    # Positive-class score for AUC metrics — mirrors the predict_proba /
+    # decision_function fallback in utils/_dataset_reducer.py.
+    if hasattr(pipe, "predict_proba"):
+        proba = pipe.predict_proba(X_test)
+        score = (
+            proba[:, 1] if proba.ndim == 2 and proba.shape[1] >= 2 else proba.ravel()
+        )
+    elif hasattr(pipe, "decision_function"):
+        score = pipe.decision_function(X_test)
+    else:
+        score = np.full(len(y_test), np.nan)
+
     return pd.DataFrame(
-        np.column_stack((y_test, pipe.predict(X_test))),
-        columns=["true", "predicted"],
+        {"true": np.asarray(y_test), "predicted": predicted, "score": score},
         index=y_test.index,
     )
 
@@ -995,7 +1006,11 @@ def nested_crossval(
             all_preds = pd.concat(
                 [pred_store[(fold_key, si, pct)] for si in range(n_splits)], axis=0
             )
-            report = classification_report(all_preds["true"], all_preds["predicted"])
+            report = classification_report(
+                all_preds["true"],
+                all_preds["predicted"],
+                y_score=all_preds["score"] if "score" in all_preds.columns else None,
+            )
             reports[(fold_key, pct)] = report
             mcc = report["MCC"]
 
@@ -1094,7 +1109,7 @@ def nested_crossval(
 def magic_now(
     X: Union[np.ndarray, pd.DataFrame, List[pd.DataFrame], Dict[str, pd.DataFrame]],
     y: Union[np.ndarray, pd.Series, list],
-    scoring: Union[str, Callable] = "balanced_accuracy",
+    scoring: Union[str, Callable] = "PR AUC",
     task: str = "classification",
     feature_selector: Union[str, list] = "optimize",
     scaler: Union[str, list] = "optimize",

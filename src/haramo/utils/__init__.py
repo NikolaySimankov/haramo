@@ -16,6 +16,10 @@ from ._evaluation import (
     pearson_scorer,
     kendall_scorer,
     spearman_scorer,
+    mcc_scorer,
+    pr_auc_scorer,
+    roc_auc_scorer,
+    resolve_scorer,
 )
 
 from ._scalers import (
@@ -47,6 +51,10 @@ __all__ = [
     "pearson_scorer",
     "kendall_scorer",
     "spearman_scorer",
+    "mcc_scorer",
+    "auc_scorer",
+    "roc_auc_scorer",
+    "resolve_scorer",
     "instantiate_standard_scaler",
     "instantiate_minmax_scaler",
     "instantiate_robust_scaler",
