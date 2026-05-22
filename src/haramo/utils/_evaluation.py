@@ -22,6 +22,7 @@ from sklearn.metrics import (
     matthews_corrcoef,
     average_precision_score,
     roc_auc_score,
+    brier_score_loss,
     precision_recall_curve,
     roc_curve,
     auc,
@@ -208,11 +209,24 @@ ks_scorer = make_scorer(
 )
 
 
+# Brier score loss is a proper scoring rule: lower is better. The Optuna
+# objective treats sklearn scorers as "higher is better", so make_scorer
+# with greater_is_better=False internally negates the value so Optuna
+# minimises it correctly. response_method is restricted to predict_proba
+# because decision_function outputs are not probabilities in [0, 1].
+brier_scorer = make_scorer(
+    brier_score_loss,
+    response_method="predict_proba",
+    greater_is_better=False,
+)
+
+
 _INTERNAL_SCORERS = {
     "MCC": mcc_scorer,
     "PR AUC": pr_auc_scorer,
     "ROC AUC": roc_auc_scorer,
     "KS": ks_scorer,
+    "Brier": brier_scorer,
 }
 
 
@@ -238,13 +252,20 @@ _SCORING_TO_COLUMN = {
     "PR AUC": "PR AUC",
     "ROC AUC": "ROC AUC",
     "KS": "KS",
+    "Brier": "Brier",
     "balanced_accuracy": "Bal. Acc.",
     "f1": "F1-score",
     "precision": "Precision",
     "recall": "Sensitivity",
     "average_precision": "PR AUC",
     "roc_auc": "ROC AUC",
+    "neg_brier_score": "Brier",
 }
+
+# Columns in classification_report where lower values are better. Used by
+# the ranking/early-stopping logic in nested_crossval so that loss-style
+# metrics (Brier) pick the minimum rather than the maximum.
+_LOWER_IS_BETTER_COLUMNS = {"Brier"}
 
 
 def scoring_to_metric_column(scoring, default="MCC"):
@@ -254,6 +275,11 @@ def scoring_to_metric_column(scoring, default="MCC"):
     if callable(scoring):
         return default
     return _SCORING_TO_COLUMN.get(scoring, default)
+
+
+def metric_is_lower_better(metric_col: str) -> bool:
+    """Return True when the named report column is a loss (lower=better)."""
+    return metric_col in _LOWER_IS_BETTER_COLUMNS
 
 
 def classification_report(true_value, predicted_value, y_score=None):
@@ -315,10 +341,18 @@ def classification_report(true_value, predicted_value, y_score=None):
         table["PR AUC"] = average_precision_score(true_value, y_score)
         table["ROC AUC"] = roc_auc_score(true_value, y_score)
         table["KS"] = ks_statistic_score(true_value, y_score)
+        # Brier requires probabilities in [0, 1]; only compute when the
+        # score column looks like one (decision_function outputs don't).
+        score_arr = np.asarray(y_score, dtype=float)
+        if score_arr.size and score_arr.min() >= 0.0 and score_arr.max() <= 1.0:
+            table["Brier"] = brier_score_loss(true_value, y_score)
+        else:
+            table["Brier"] = float("nan")
     else:
         table["PR AUC"] = float("nan")
         table["ROC AUC"] = float("nan")
         table["KS"] = float("nan")
+        table["Brier"] = float("nan")
 
     return pd.Series(table)
 

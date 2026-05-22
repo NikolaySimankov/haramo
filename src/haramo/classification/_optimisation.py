@@ -38,6 +38,7 @@ from ..utils import (
     reduce_dataset,
     resolve_scorer,
     scoring_to_metric_column,
+    metric_is_lower_better,
     plot_pr_curve,
     plot_roc_curve,
     plot_ks_statistic,
@@ -908,6 +909,10 @@ def nested_crossval(
     # the same metric the HPO optimised. Falls back to MCC for callable
     # scorers or unrecognised strings.
     metric_col = scoring_to_metric_column(scoring, default="MCC")
+    lower_better = metric_is_lower_better(metric_col)
+    _is_better = (lambda new, cur: new <= cur) if lower_better else (lambda new, cur: new >= cur)
+    _idxbest = (lambda s: s.idxmin()) if lower_better else (lambda s: s.idxmax())
+    _worst_init = float("inf") if lower_better else float("-inf")
 
     if outer_cv_groups is not None:
         strat_kfold_outer = StratifiedGroupKFold(n_splits=4)
@@ -972,7 +977,7 @@ def nested_crossval(
     # Incremental pct loop: parallel over active fold_keys per pct,     #
     # with early stopping after two consecutive dips below best score.  #
     # ------------------------------------------------------------------ #
-    best_score_es: dict = {fk: float("-inf") for fk in pipelines}
+    best_score_es: dict = {fk: _worst_init for fk in pipelines}
     flagged_es: dict = {fk: False for fk in pipelines}
     active_es: dict = {fk: True for fk in pipelines}
     reduced_idx: dict = {}
@@ -1041,18 +1046,19 @@ def nested_crossval(
             reports[(fold_key, pct)] = report
             score_val = report[metric_col]
 
+            cmp = "<" if not lower_better else ">"
             if not flagged_es[fold_key]:
-                if score_val >= best_score_es[fold_key]:
+                if _is_better(score_val, best_score_es[fold_key]):
                     best_score_es[fold_key] = score_val
                 else:
                     flagged_es[fold_key] = True
                     print(
                         f"[nested_crossval] {fold_key!r} dip at {int(pct * 100)}%"
-                        f" ({metric_col}={score_val:.4f} < best={best_score_es[fold_key]:.4f})"
+                        f" ({metric_col}={score_val:.4f} {cmp} best={best_score_es[fold_key]:.4f})"
                         " — giving one more chance …"
                     )
             else:
-                if score_val >= best_score_es[fold_key]:
+                if _is_better(score_val, best_score_es[fold_key]):
                     flagged_es[fold_key] = False
                     best_score_es[fold_key] = score_val
                 else:
@@ -1060,7 +1066,7 @@ def nested_crossval(
                     flagged_es[fold_key] = False
                     print(
                         f"[nested_crossval] Early stop {fold_key!r} at {int(pct * 100)}%"
-                        f" ({metric_col}={score_val:.4f} < best={best_score_es[fold_key]:.4f})"
+                        f" ({metric_col}={score_val:.4f} {cmp} best={best_score_es[fold_key]:.4f})"
                     )
 
     # ------------------------------------------------------------------ #
@@ -1085,7 +1091,7 @@ def nested_crossval(
         best_predictions = []
         for alg in algorithms:
             alg_df = validation.loc[alg]
-            best_fold_key, best_pct = alg_df[metric_col].idxmax()
+            best_fold_key, best_pct = _idxbest(alg_df[metric_col])
             best_score = alg_df.loc[(best_fold_key, best_pct), metric_col]
             print(
                 f"[nested_crossval] {alg}: best fold={best_fold_key!r} "
@@ -1107,7 +1113,7 @@ def nested_crossval(
             # its own best pct, concatenated across the n_splits test folds.
             alg_predictions = {}
             for fk in alg_df.index.get_level_values("fold").unique():
-                fk_best_pct = alg_df.loc[fk, metric_col].idxmax()
+                fk_best_pct = _idxbest(alg_df.loc[fk, metric_col])
                 alg_predictions[fk] = pd.concat(
                     [pred_store[(fk, si, fk_best_pct)] for si in range(n_splits)],
                     axis=0,
@@ -1125,7 +1131,7 @@ def nested_crossval(
         index=pd.MultiIndex.from_tuples(index_tuples, names=["fold", "reduction"]),
     )
 
-    best_fold, best_pct = validation[metric_col].idxmax()
+    best_fold, best_pct = _idxbest(validation[metric_col])
     best_score = validation.loc[(best_fold, best_pct), metric_col]
     print(
         f"[nested_crossval] Best: {best_fold!r} @ {int(best_pct * 100)}% "
@@ -1145,7 +1151,7 @@ def nested_crossval(
     # concatenated across the n_splits test folds.
     best_predictions = {}
     for fk in validation.index.get_level_values("fold").unique():
-        fk_best_pct = validation.loc[fk, metric_col].idxmax()
+        fk_best_pct = _idxbest(validation.loc[fk, metric_col])
         best_predictions[fk] = pd.concat(
             [pred_store[(fk, si, fk_best_pct)] for si in range(n_splits)],
             axis=0,
