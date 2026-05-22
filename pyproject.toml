@@ -1,6 +1,6 @@
 [project]
 name = "haramo"
-version = "0.5.0"
+version = "0.7.0"
 description = "Holistic AutoML-driven Robust Pipeline for Applied Multi-Omics"
 authors = [
     {name = "NikolaySimankov", email = "77026145+NikolaySimankov@users.noreply.github.com"}
@@ -24,8 +24,8 @@ dependencies = [
   "numpy==2.2.2",
   "optuna==4.2.0",
   "pandas==2.2.3",
-  "plotly==6.0.0",
-  "scikit-learn==1.6.1",
+  "plotly==6.6.0",
+  "scikit-learn==1.8.0",
   "lightgbm==4.5.0",
   "xgboost==3.2.0",
   "catboost==1.2.10",
