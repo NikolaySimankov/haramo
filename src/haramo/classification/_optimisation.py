@@ -1332,7 +1332,10 @@ def magic_now(
                 "fold": best_key,
                 "best_score": best_study.best_value,
             }
+            # user_attrs override params so suggest_power values appear in
+            # their exponentiated form (e.g. learning_rate=0.01 not -2).
             row.update(best_study.best_trial.params)
+            row.update(best_study.best_trial.user_attrs)
             best_params_rows.append(row)
 
         best_params_df = pd.DataFrame(best_params_rows).set_index("algorithm")

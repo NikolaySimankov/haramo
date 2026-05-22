@@ -33,8 +33,8 @@ def instantiate_RBFSVM_Classifier(
 ):
     if hyperparameters == "optimize":
         params = {
-            "C": trial.suggest_float("C", 1e-4, 1e1, log=True),
-            "gamma": trial.suggest_float("gamma", 1e-4, 1e1, log=True),
+            "C": trial.suggest_power("C", -4, 1, base=10),
+            "gamma": trial.suggest_power("gamma", -4, 1, base=10),
         }
     elif hyperparameters == "default":
         params = {}
@@ -50,7 +50,7 @@ def instantiate_LSVM_Classifier(
 ):
     if hyperparameters == "optimize":
         params = {
-            "gamma": trial.suggest_float("gamma", 1e-4, 1e1, log=True),
+            "gamma": trial.suggest_power("gamma", -4, 1, base=10),
             "degree": trial.suggest_int("degree", 2, 4),
             "kernel": trial.suggest_categorical("kernel", ["linear", "poly"]),
         }
@@ -68,8 +68,8 @@ def instantiate_NuLSVM_Classifier(
 ):
     if hyperparameters == "optimize":
         params = {
-            "nu": trial.suggest_float("nu", 1e-2, 1, log=True),
-            "gamma": trial.suggest_float("gamma", 1e-4, 1e1, log=True),
+            "nu": trial.suggest_power("nu", -2, 0, base=10),
+            "gamma": trial.suggest_power("gamma", -4, 1, base=10),
             "degree": trial.suggest_int("degree", 2, 4),
             "kernel": trial.suggest_categorical("kernel", ["linear", "poly"]),
         }
@@ -87,8 +87,8 @@ def instantiate_NuRBFSVM_Classifier(
 ):
     if hyperparameters == "optimize":
         params = {
-            "nu": trial.suggest_float("nu", 1e-4, 1e1, log=True),
-            "gamma": trial.suggest_float("gamma", 1e-4, 1e1, log=True),
+            "nu": trial.suggest_power("nu", -4, 1, base=10),
+            "gamma": trial.suggest_power("gamma", -4, 1, base=10),
         }
     elif hyperparameters == "default":
         params = {}
@@ -104,7 +104,7 @@ def instantiate_SGD_Classifier(
 ):
     if hyperparameters == "optimize":
         params = {
-            "alpha": trial.suggest_float("SGD_alpha", 1e-4, 1e1, log=True),
+            "alpha": trial.suggest_power("SGD_alpha", -4, 1, base=10),
         }
     elif hyperparameters == "default":
         params = {}
@@ -129,7 +129,7 @@ def instantiate_MLP_Classifier(
                 list(itertools.product([50, 100, 200], repeat=2))
                 + list(itertools.product([50, 100, 200], repeat=3)),
             ),
-            "alpha": trial.suggest_float("MLP_alpha", 1e-4, 1e1),
+            "alpha": trial.suggest_power("MLP_alpha", -4, 1, base=10),
         }
     elif hyperparameters == "default":
         params = {}
@@ -145,9 +145,7 @@ def instantiate_RF_Classifier(
 ):
     if hyperparameters == "optimize":
         params = {
-            "n_estimators": trial.suggest_int(
-                "RF_n_estimators", 2**7, 2**11, step=2**7
-            ),
+            "n_estimators": trial.suggest_power("RF_n_estimators", 7, 11, base=2),
             "max_leaf_nodes": trial.suggest_int("max_leaf_nodes", 5, 35, step=5),
         }
     elif hyperparameters == "default":
@@ -166,9 +164,7 @@ def instantiate_ET_Classifier(
 ):
     if hyperparameters == "optimize":
         params = {
-            "n_estimators": trial.suggest_int(
-                "ET_n_estimators", 2**7, 2**11, step=2**7
-            ),
+            "n_estimators": trial.suggest_power("ET_n_estimators", 7, 11, base=2),
             "max_leaf_nodes": trial.suggest_int("max_leaf_nodes", 5, 35, step=5),
         }
     elif hyperparameters == "default":
@@ -186,10 +182,10 @@ def instantiate_LGBM_Classifier(
     if hyperparameters == "optimize":
         params = {
             "num_leaves": trial.suggest_int("num_leaves", 5, 50, step=5),
-            "learning_rate": trial.suggest_float("learning_rate", 1e-3, 1e-0, log=True),
-            "n_estimators": trial.suggest_int("n_estimators", 2**7, 2**11, step=2**7),
-            "reg_alpha": trial.suggest_float("reg_alpha", 1e-3, 1e1, log=True),
-            "reg_lambda": trial.suggest_float("reg_lambda", 1e-3, 1e1, log=True),
+            "learning_rate": trial.suggest_power("learning_rate", -3, 0, base=10),
+            "n_estimators": trial.suggest_power("n_estimators", 7, 11, base=2),
+            "reg_alpha": trial.suggest_power("reg_alpha", -3, 1, base=10),
+            "reg_lambda": trial.suggest_power("reg_lambda", -3, 1, base=10),
             "colsample_bytree": trial.suggest_float(
                 "colsample_bytree", 0.2, 1.0, step=0.1
             ),
@@ -213,10 +209,10 @@ def instantiate_XGB_Classifier(
     if hyperparameters == "optimize":
         params = {
             "max_leaves": trial.suggest_int("max_leaves", 5, 50, step=5),
-            "learning_rate": trial.suggest_float("learning_rate", 1e-3, 1e-0, log=True),
-            "n_estimators": trial.suggest_int("n_estimators", 2**7, 2**11, step=2**7),
-            "reg_alpha": trial.suggest_float("reg_alpha", 1e-3, 1e1, log=True),
-            "reg_lambda": trial.suggest_float("reg_lambda", 1e-3, 1e1, log=True),
+            "learning_rate": trial.suggest_power("learning_rate", -3, 0, base=10),
+            "n_estimators": trial.suggest_power("n_estimators", 7, 11, base=2),
+            "reg_alpha": trial.suggest_power("reg_alpha", -3, 1, base=10),
+            "reg_lambda": trial.suggest_power("reg_lambda", -3, 1, base=10),
             "colsample_bytree": trial.suggest_float(
                 "colsample_bytree", 0.2, 1.0, step=0.1
             ),
@@ -242,9 +238,9 @@ def instantiate_CatBoost_Classifier(
     if hyperparameters == "optimize":
         params = {
             "depth": trial.suggest_int("depth", 3, 10, step=1),
-            "learning_rate": trial.suggest_float("learning_rate", 1e-3, 1e-0, log=True),
-            "iterations": trial.suggest_int("iterations", 2**7, 2**11, step=2**7),
-            "l2_leaf_reg": trial.suggest_float("l2_leaf_reg", 1e-3, 1e1, log=True),
+            "learning_rate": trial.suggest_power("learning_rate", -3, 0, base=10),
+            "iterations": trial.suggest_power("iterations", 7, 11, base=2),
+            "l2_leaf_reg": trial.suggest_power("l2_leaf_reg", -3, 1, base=10),
             "colsample_bylevel": trial.suggest_float(
                 "colsample_bylevel", 0.2, 1.0, step=0.1
             ),
@@ -283,7 +279,7 @@ def instantiate_ENet_Classifier(
 ):
     if hyperparameters == "optimize":
         params = {
-            "C": trial.suggest_float("C", 1e-4, 1e1, log=True),
+            "C": trial.suggest_power("C", -4, 1, base=10),
             "l1_ratio": trial.suggest_float("l1_ratio", 0.0, 1.0, step=0.1),
         }
     elif hyperparameters == "default":
@@ -300,7 +296,7 @@ def instantiate_PrimalLR_Classifier(
 ):
     if hyperparameters == "optimize":
         params = {
-            "C": trial.suggest_float("C", 1e-4, 1e1, log=True),
+            "C": trial.suggest_power("C", -4, 1, base=10),
             "solver": trial.suggest_categorical(
                 "LR_solver", ["newton-cg", "lbfgs", "liblinear", "sag", "saga"]
             ),
@@ -319,7 +315,7 @@ def instantiate_DualLR_Classifier(
 ):
     if hyperparameters == "optimize":
         params = {
-            "C": trial.suggest_float("C", 1e-4, 1e1, log=True),
+            "C": trial.suggest_power("C", -4, 1, base=10),
         }
     elif hyperparameters == "default":
         params = {}
@@ -337,7 +333,7 @@ def instantiate_Ridge_Classifier(
 ):
     if hyperparameters == "optimize":
         params = {
-            "alpha": trial.suggest_float("alpha", 1e-4, 1e1, log=True),
+            "alpha": trial.suggest_power("alpha", -4, 1, base=10),
         }
     elif hyperparameters == "default":
         params = {}
