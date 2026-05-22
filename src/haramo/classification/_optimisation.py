@@ -33,7 +33,14 @@ from optuna.pruners import SuccessiveHalvingPruner
 from optuna.samplers import GridSampler
 
 from ._instantiation import instantiate_pipeline
-from ..utils import classification_report, reduce_dataset, resolve_scorer
+from ..utils import (
+    classification_report,
+    reduce_dataset,
+    resolve_scorer,
+    plot_pr_curve,
+    plot_roc_curve,
+    plot_ks_statistic,
+)
 from ..feature_selection import select_best_dataset_combo, select_best_feature_selector
 
 #############
@@ -876,6 +883,13 @@ def nested_crossval(
         Classification report with MultiIndex as described above.
     best_pipeline : Pipeline or list of Pipeline
         Single best pipeline or one per algorithm (per-algorithm mode).
+    best_predictions : dict or list of dict
+        Per-outer-fold model predictions ``{fold_key -> DataFrame[true,
+        predicted, score]}``. Each entry concatenates the n_splits test
+        folds for that model at its own best reduction pct, so the dict
+        contains one row per competing model (typically 4). In per-algorithm
+        mode, an ordered list aligned with ``algorithms``. Suitable input
+        for ``plot_pr_curve`` / ``plot_roc_curve``.
     """
     sample_weight = pd.Series(
         compute_sample_weight(class_weight="balanced", y=y),
@@ -1055,6 +1069,7 @@ def nested_crossval(
         )
 
         best_pipelines = []
+        best_predictions = []
         for alg in algorithms:
             alg_df = validation.loc[alg]
             best_fold_key, best_pct = alg_df["MCC"].idxmax()
@@ -1075,8 +1090,18 @@ def nested_crossval(
                     max_svm_samples=max_svm_samples,
                 )
             )
+            # Surface every competing outer-fold model for this algorithm at
+            # its own best pct, concatenated across the n_splits test folds.
+            alg_predictions = {}
+            for fk in alg_df.index.get_level_values("fold").unique():
+                fk_best_pct = alg_df.loc[fk, "MCC"].idxmax()
+                alg_predictions[fk] = pd.concat(
+                    [pred_store[(fk, si, fk_best_pct)] for si in range(n_splits)],
+                    axis=0,
+                )
+            best_predictions.append(alg_predictions)
 
-        return validation, best_pipelines
+        return validation, best_pipelines, best_predictions
 
     # ------------------------------------------------------------------ #
     # Single-algorithm mode                                                #
@@ -1103,7 +1128,17 @@ def nested_crossval(
         max_svm_samples=max_svm_samples,
     )
 
-    return validation, best_model
+    # Surface every competing outer-fold model at its own best pct,
+    # concatenated across the n_splits test folds.
+    best_predictions = {}
+    for fk in validation.index.get_level_values("fold").unique():
+        fk_best_pct = validation.loc[fk, "MCC"].idxmax()
+        best_predictions[fk] = pd.concat(
+            [pred_store[(fk, si, fk_best_pct)] for si in range(n_splits)],
+            axis=0,
+        )
+
+    return validation, best_model, best_predictions
 
 
 def magic_now(
@@ -1122,6 +1157,7 @@ def magic_now(
     inner_cv_groups: Union[np.ndarray, pd.Series, list] = None,
     tag: str = "",
     n_jobs: int = 12,
+    plots: bool = True,
 ):
 
     if not output_dir:
@@ -1137,7 +1173,8 @@ def magic_now(
     trials_dir.mkdir(exist_ok=True)
 
     plots_dir = output_dir / "plots"
-    plots_dir.mkdir(exist_ok=True)
+    if plots:
+        plots_dir.mkdir(exist_ok=True)
 
     if isinstance(X, (list, dict)):
         if isinstance(X, list):
@@ -1190,7 +1227,7 @@ def magic_now(
         n_jobs=n_jobs,
     )
 
-    validation, pipeline = nested_crossval(
+    validation, pipeline, predictions = nested_crossval(
         X=X,
         y=y,
         pipelines=pipelines,
@@ -1217,6 +1254,34 @@ def magic_now(
         "wb",
     ) as handle:
         pickle.dump(studies, handle)
+
+    # ---------------------------------------------------------------------#
+    # PR / ROC curve plots — one curve per outer-fold model, mean +/- std #
+    # ---------------------------------------------------------------------#
+    if plots:
+        if per_alg_mode:
+            for alg, preds in zip(algorithm, predictions):
+                plot_pr_curve(
+                    preds,
+                    plots_dir / f"pr_curve_{alg}{tag}.pdf",
+                    title=f"PR curve — {alg}",
+                )
+                plot_roc_curve(
+                    preds,
+                    plots_dir / f"roc_curve_{alg}{tag}.pdf",
+                    title=f"ROC curve — {alg}",
+                )
+                plot_ks_statistic(
+                    preds,
+                    plots_dir / f"ks_statistic_{alg}{tag}.pdf",
+                    title=f"KS statistic — {alg}",
+                )
+        else:
+            plot_pr_curve(predictions, plots_dir / f"pr_curve{tag}.pdf", title="PR curve")
+            plot_roc_curve(predictions, plots_dir / f"roc_curve{tag}.pdf", title="ROC curve")
+            plot_ks_statistic(
+                predictions, plots_dir / f"ks_statistic{tag}.pdf", title="KS statistic"
+            )
 
     n_1 = int((y == 1).sum())
     n_0 = int((y == 0).sum())

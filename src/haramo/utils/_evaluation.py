@@ -22,6 +22,9 @@ from sklearn.metrics import (
     matthews_corrcoef,
     average_precision_score,
     roc_auc_score,
+    precision_recall_curve,
+    roc_curve,
+    auc,
     make_scorer,
     get_scorer,
 )
@@ -142,10 +145,64 @@ pr_auc_scorer = make_scorer(average_precision_score, needs_proba=True)
 roc_auc_scorer = make_scorer(roc_auc_score, needs_proba=True)
 
 
+def decile_table_ks(y_true, y_score, n_deciles=10):
+    """Build a decile table for the KS statistic.
+
+    Sorts instances by score (descending) and splits them into ``n_deciles``
+    equal-sized buckets. For each cumulative bucket, computes:
+
+    - ``cum_positive_rate``: share of all positives captured so far
+    - ``cum_negative_rate``: share of all negatives captured so far
+    - ``KS``: ``|cum_positive_rate - cum_negative_rate|``
+
+    The maximum of ``KS`` is the Kolmogorov-Smirnov statistic.
+    """
+    y_true = np.asarray(y_true).astype(int)
+    y_score = np.asarray(y_score, dtype=float)
+    order = np.argsort(-y_score, kind="stable")
+    y_sorted = y_true[order]
+
+    n = len(y_sorted)
+    total_pos = max(int(y_true.sum()), 1)
+    total_neg = max(int(n - y_true.sum()), 1)
+    edges = np.linspace(0, n, n_deciles + 1, dtype=int)
+
+    rows = []
+    cum_pos = 0
+    cum_neg = 0
+    for i in range(n_deciles):
+        bucket = y_sorted[edges[i] : edges[i + 1]]
+        cum_pos += int(bucket.sum())
+        cum_neg += int(len(bucket) - bucket.sum())
+        cpr = cum_pos / total_pos
+        cnr = cum_neg / total_neg
+        rows.append(
+            {
+                "decile": i + 1,
+                "cum_positive_rate": cpr,
+                "cum_negative_rate": cnr,
+                "KS": abs(cpr - cnr),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def ks_statistic_score(y_true, y_score):
+    """Compute the KS statistic from binary labels and positive-class scores.
+
+    Returns a value in ``[0, 1]``; higher is better separation.
+    """
+    return float(decile_table_ks(y_true, y_score, n_deciles=10)["KS"].max())
+
+
+ks_scorer = make_scorer(ks_statistic_score, needs_proba=True)
+
+
 _INTERNAL_SCORERS = {
     "MCC": mcc_scorer,
     "PR AUC": pr_auc_scorer,
     "ROC AUC": roc_auc_scorer,
+    "KS": ks_scorer,
 }
 
 
@@ -221,9 +278,11 @@ def classification_report(true_value, predicted_value, y_score=None):
     if y_score is not None and not pd.isna(np.asarray(y_score, dtype=float)).all():
         table["PR AUC"] = average_precision_score(true_value, y_score)
         table["ROC AUC"] = roc_auc_score(true_value, y_score)
+        table["KS"] = ks_statistic_score(true_value, y_score)
     else:
         table["PR AUC"] = float("nan")
         table["ROC AUC"] = float("nan")
+        table["KS"] = float("nan")
 
     return pd.Series(table)
 
@@ -295,3 +354,217 @@ def plot_confusion_matrix(true_values, predicted_values, title):
     plt.savefig(plots / f"{title}.pdf")
     # plt.show()  # Uncomment to show the plot
     plt.close()  # Close the plot to free memory
+
+
+def _aggregate_curves(curves, grid):
+    """Interpolate per-fold curves onto a shared grid; return (mean, std).
+
+    Each entry in ``curves`` is a tuple ``(x, y)`` where x is monotonically
+    increasing — callers are responsible for the order-flip when needed
+    (e.g. PR curves return recall decreasing).
+    """
+    interp = [np.interp(grid, x, y) for x, y in curves]
+    interp = np.asarray(interp)
+    return interp.mean(axis=0), interp.std(axis=0)
+
+
+def plot_pr_curve(predictions_by_model, output_path, title=None, mark_cutoff=0.5):
+    """Plot one PR curve per competing outer-fold model + mean +/- std band.
+
+    Parameters
+    ----------
+    predictions_by_model : dict[str, pd.DataFrame]
+        Mapping ``model_key -> DataFrame`` with columns
+        ``["true", "predicted", "score"]``. Each entry is the model's
+        out-of-fold predictions concatenated across its CV test splits.
+    output_path : path-like
+        Destination PDF path.
+    title : str, optional
+    mark_cutoff : float, default 0.5
+        Probability threshold to highlight as the default decision point;
+        the average ``(recall, precision)`` at this threshold across models
+        is plotted as a marker. Pass ``None`` to skip the marker.
+    """
+    fig, ax = plt.subplots(figsize=(6, 6))
+    aps, per_model = [], []
+    recall_grid = np.linspace(0, 1, 100)
+
+    for model_key, df in sorted(predictions_by_model.items()):
+        y_true = df["true"].to_numpy()
+        y_score = df["score"].to_numpy()
+        precision, recall, _ = precision_recall_curve(y_true, y_score)
+        ap = average_precision_score(y_true, y_score)
+        aps.append(ap)
+        # precision_recall_curve returns recall decreasing; flip for np.interp
+        per_model.append((recall[::-1], precision[::-1]))
+        ax.plot(
+            recall, precision, alpha=0.4, lw=1,
+            label=f"{model_key} (AP={ap:.2f})",
+        )
+
+    mean_p, std_p = _aggregate_curves(per_model, recall_grid)
+    ax.plot(
+        recall_grid, mean_p, color="b", lw=2,
+        label=fr"Mean PR (AP = {np.mean(aps):.2f} $\pm$ {np.std(aps):.2f})",
+    )
+    ax.fill_between(
+        recall_grid,
+        np.clip(mean_p - std_p, 0, 1),
+        np.clip(mean_p + std_p, 0, 1),
+        color="grey", alpha=0.2, label=r"$\pm$ 1 std. dev.",
+    )
+
+    if mark_cutoff is not None:
+        rs, ps = [], []
+        for df in predictions_by_model.values():
+            y_true = df["true"].to_numpy()
+            y_score = df["score"].to_numpy()
+            y_pred_cut = (y_score >= mark_cutoff).astype(int)
+            rs.append(recall_score(y_true, y_pred_cut, zero_division=0))
+            ps.append(precision_score(y_true, y_pred_cut, zero_division=0))
+        ax.plot(
+            np.mean(rs), np.mean(ps), marker="o", markersize=10,
+            color="tab:blue",
+            label=f"Default cut-off @ p={mark_cutoff}",
+        )
+
+    ax.set(
+        xlabel="Recall", ylabel="Precision",
+        xlim=(-0.01, 1.01), ylim=(-0.01, 1.01),
+        title=title or "Precision-Recall curve (outer-fold models)",
+    )
+    ax.legend(loc="lower left", fontsize=8)
+    plt.tight_layout()
+    plt.savefig(output_path)
+    plt.close(fig)
+
+
+def plot_ks_statistic(predictions_by_model, output_path, title=None, n_deciles=10):
+    """Plot per-model KS curves (cum-positive vs cum-negative) + mean band.
+
+    For each competing outer-fold model, builds a decile table and plots its
+    cumulative positive- and negative-class rates against decile rank. A bold
+    mean curve and ``+/- 1`` std band are overlaid across models. The KS
+    statistic (max gap between the two mean curves) is annotated.
+
+    Parameters
+    ----------
+    predictions_by_model : dict[str, pd.DataFrame]
+        Mapping ``model_key -> DataFrame`` with columns
+        ``["true", "predicted", "score"]``.
+    output_path : path-like
+    title : str, optional
+    n_deciles : int, default 10
+        Number of buckets to split the score-ranked instances into.
+    """
+    fig, ax = plt.subplots(figsize=(6, 6))
+    deciles = np.arange(0, n_deciles + 1)
+
+    pos_curves, neg_curves, ks_maxes = [], [], []
+
+    for model_key, df in sorted(predictions_by_model.items()):
+        dt = decile_table_ks(
+            df["true"].to_numpy(), df["score"].to_numpy(), n_deciles=n_deciles
+        )
+        cum_pos = np.append(0.0, dt["cum_positive_rate"].values)
+        cum_neg = np.append(0.0, dt["cum_negative_rate"].values)
+        pos_curves.append(cum_pos)
+        neg_curves.append(cum_neg)
+        ks_max = float(dt["KS"].max())
+        ks_maxes.append(ks_max)
+
+        ax.plot(deciles, cum_pos, alpha=0.35, color="tab:green", lw=1)
+        ax.plot(deciles, cum_neg, alpha=0.35, color="tab:red", lw=1)
+
+    pos_arr = np.asarray(pos_curves)
+    neg_arr = np.asarray(neg_curves)
+    mean_pos, std_pos = pos_arr.mean(axis=0), pos_arr.std(axis=0)
+    mean_neg, std_neg = neg_arr.mean(axis=0), neg_arr.std(axis=0)
+
+    ax.plot(deciles, mean_pos, marker="o", color="tab:green", lw=2,
+            label="Mean cum. positives")
+    ax.plot(deciles, mean_neg, marker="o", color="tab:red", lw=2,
+            label="Mean cum. negatives")
+    ax.fill_between(deciles, np.clip(mean_pos - std_pos, 0, 1),
+                    np.clip(mean_pos + std_pos, 0, 1),
+                    color="tab:green", alpha=0.15)
+    ax.fill_between(deciles, np.clip(mean_neg - std_neg, 0, 1),
+                    np.clip(mean_neg + std_neg, 0, 1),
+                    color="tab:red", alpha=0.15)
+
+    diffs = np.abs(mean_pos - mean_neg)
+    ks_decile_mean = int(np.argmax(diffs))
+    mean_ks = float(np.mean(ks_maxes))
+    std_ks = float(np.std(ks_maxes))
+    ax.plot(
+        [ks_decile_mean, ks_decile_mean],
+        [mean_neg[ks_decile_mean], mean_pos[ks_decile_mean]],
+        linestyle="--", marker="o", color="tab:blue", lw=2,
+        label=fr"KS = {mean_ks:.3f} $\pm$ {std_ks:.3f} @ decile {ks_decile_mean}",
+    )
+
+    ax.set(
+        xlabel="Deciles", ylabel="Cumulative rate",
+        xlim=(0, n_deciles), ylim=(0, 1),
+        title=title or "KS statistic (outer-fold models)",
+    )
+    ax.legend(loc="lower right", fontsize=8)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(output_path)
+    plt.close(fig)
+
+
+def plot_roc_curve(predictions_by_model, output_path, title=None):
+    """Plot one ROC curve per competing outer-fold model + mean +/- std band.
+
+    Parameters
+    ----------
+    predictions_by_model : dict[str, pd.DataFrame]
+        Mapping ``model_key -> DataFrame`` with columns
+        ``["true", "predicted", "score"]``. Each entry is the model's
+        out-of-fold predictions concatenated across its CV test splits.
+    output_path : path-like
+    title : str, optional
+    """
+    fig, ax = plt.subplots(figsize=(6, 6))
+    aucs, per_model = [], []
+    fpr_grid = np.linspace(0, 1, 100)
+
+    for model_key, df in sorted(predictions_by_model.items()):
+        y_true = df["true"].to_numpy()
+        y_score = df["score"].to_numpy()
+        fpr, tpr, _ = roc_curve(y_true, y_score)
+        roc_auc_val = auc(fpr, tpr)
+        aucs.append(roc_auc_val)
+        per_model.append((fpr, tpr))
+        ax.plot(
+            fpr, tpr, alpha=0.4, lw=1,
+            label=f"{model_key} (AUC={roc_auc_val:.2f})",
+        )
+
+    mean_tpr, std_tpr = _aggregate_curves(per_model, fpr_grid)
+    mean_tpr[0], mean_tpr[-1] = 0.0, 1.0
+    ax.plot(
+        fpr_grid, mean_tpr, color="b", lw=2,
+        label=fr"Mean ROC (AUC = {np.mean(aucs):.2f} $\pm$ {np.std(aucs):.2f})",
+    )
+    ax.fill_between(
+        fpr_grid,
+        np.clip(mean_tpr - std_tpr, 0, 1),
+        np.clip(mean_tpr + std_tpr, 0, 1),
+        color="grey", alpha=0.2, label=r"$\pm$ 1 std. dev.",
+    )
+    ax.plot(
+        [0, 1], [0, 1], linestyle="--", color="gray", alpha=0.5, label="Chance",
+    )
+
+    ax.set(
+        xlabel="False Positive Rate", ylabel="True Positive Rate",
+        xlim=(-0.01, 1.01), ylim=(-0.01, 1.01),
+        title=title or "ROC curve (outer-fold models)",
+    )
+    ax.legend(loc="lower right", fontsize=8)
+    plt.tight_layout()
+    plt.savefig(output_path)
+    plt.close(fig)
