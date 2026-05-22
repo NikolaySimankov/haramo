@@ -66,9 +66,9 @@ if __name__ == "__main__":
         "ctdd": "X_ctdd.tsv",
         # "aac": "X_aac.tsv",
         # "b2b": "X_b2btools.tsv",
-        # "nsp": "X_netsurfp.tsv",
+        "nsp": "X_netsurfp.tsv",
         # "residue": "X_residue.tsv",
-        # "biophys": "X_biophys.tsv",
+        "biophys": "X_biophys.tsv",
         "class": "X_class.tsv",
     }
 
@@ -98,11 +98,11 @@ if __name__ == "__main__":
         # "Coat protein",
         # "Movement protein",
         # "Transactivator-Viroplasmin protein",
-        "RNA silencing suppressor",
+        # "RNA silencing suppressor",
         # "Vector transmission protein",
         # "RNA-dependent RNA polymerase complex",
         # "Reverse transcriptase complex",
-        # "Glycoprotein",
+        "Glycoprotein",
     ]
 
     for protein in proteins:
@@ -135,32 +135,28 @@ if __name__ == "__main__":
                 ascending=False
             )
             consistant_targets = prot_counts[prot_counts >= 100].index
-            # chose 3 random consistant targets for each protein
-            consistant_targets = (
-                consistant_targets.to_series().sample(n=3, random_state=42).index
-                if len(consistant_targets) >= 3
-                else consistant_targets
+            # chose 2 random consistant targets for each protein
+
+            target = "Gomphrena globosa"
+            # for target in consistant_targets:
+
+            y = targets[target].dropna()
+            groups = groups.loc[y.index]
+            datasets = {name: X.loc[y.index] for name, X in datasets.items()}
+
+            magic_now(
+                X=datasets,
+                y=y,
+                outer_cv_groups=groups,
+                inner_cv_groups=groups,
+                scoring="PR AUC",
+                algorithm=["LGBM", "CatB"],
+                scaler="robust",
+                feature_selector="pvalue",
+                hyperparameters="optimize",
+                n_trials=10,
+                output_dir=output_dir,
+                plots=True,
+                tag=f"_{protein}_{target}",
+                n_jobs=12,
             )
-
-            for target in consistant_targets:
-
-                y = targets[target].dropna()
-                groups = groups.loc[y.index]
-                datasets = {name: X.loc[y.index] for name, X in datasets.items()}
-
-                magic_now(
-                    X=datasets,
-                    y=y,
-                    outer_cv_groups=groups,
-                    inner_cv_groups=groups,
-                    scoring="KS",
-                    algorithm=["LGBM", "CatB"],
-                    scaler="robust",
-                    feature_selector="pvalue",
-                    hyperparameters="optimize",
-                    n_trials=10,
-                    output_dir=output_dir,
-                    plot=True,
-                    tag=f"_{protein}_{target}",
-                    n_jobs=12,
-                )

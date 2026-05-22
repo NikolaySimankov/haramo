@@ -92,7 +92,7 @@ class GreedyBorutaPyWrapper(GreedyBorutaPy):
         return X
 
 
-class TransformerWrapper:
+class TransformerWrapper(BaseEstimator, TransformerMixin):
     def __init__(self, scaler: callable):
         self.scaler = scaler
 

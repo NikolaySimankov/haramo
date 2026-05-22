@@ -138,11 +138,18 @@ def biserial_scorer(X, y):
 mcc_scorer = make_scorer(matthews_corrcoef)
 
 # PR-AUC (Average Precision) is better adapted to imbalanced binary than
-# ROC-AUC because it focuses on the positive class. needs_proba=True so
-# sklearn forwards predict_proba/decision_function to the metric.
-pr_auc_scorer = make_scorer(average_precision_score, needs_proba=True)
+# ROC-AUC because it focuses on the positive class. The response_method
+# list tries predict_proba first, then falls back to decision_function so
+# classifiers without predict_proba (e.g. RidgeClassifier) still score.
+pr_auc_scorer = make_scorer(
+    average_precision_score,
+    response_method=["predict_proba", "decision_function"],
+)
 
-roc_auc_scorer = make_scorer(roc_auc_score, needs_proba=True)
+roc_auc_scorer = make_scorer(
+    roc_auc_score,
+    response_method=["predict_proba", "decision_function"],
+)
 
 
 def decile_table_ks(y_true, y_score, n_deciles=10):
@@ -195,7 +202,10 @@ def ks_statistic_score(y_true, y_score):
     return float(decile_table_ks(y_true, y_score, n_deciles=10)["KS"].max())
 
 
-ks_scorer = make_scorer(ks_statistic_score, needs_proba=True)
+ks_scorer = make_scorer(
+    ks_statistic_score,
+    response_method=["predict_proba", "decision_function"],
+)
 
 
 _INTERNAL_SCORERS = {
