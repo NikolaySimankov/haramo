@@ -102,7 +102,7 @@ if __name__ == "__main__":
         # "Vector transmission protein",
         # "RNA-dependent RNA polymerase complex",
         # "Reverse transcriptase complex",
-        "Glycoprotein",
+        # "Glycoprotein",
     ]
 
     for protein in proteins:

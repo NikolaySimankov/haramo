@@ -37,6 +37,7 @@ from ..utils import (
     classification_report,
     reduce_dataset,
     resolve_scorer,
+    scoring_to_metric_column,
     plot_pr_curve,
     plot_roc_curve,
     plot_ks_statistic,
@@ -840,6 +841,7 @@ def nested_crossval(
     X: Union[np.ndarray, pd.DataFrame],
     y: Union[np.ndarray, pd.Series, list],
     pipelines: dict,
+    scoring: Union[str, Callable] = "MCC",
     random_state: int = 42,
     outer_cv_groups: Union[np.ndarray, pd.Series, list] = None,
     n_jobs: int = 16,
@@ -866,6 +868,12 @@ def nested_crossval(
     pipelines : dict
         Mapping key → fitted Pipeline.  Single-algorithm mode: keys are
         ``"fold_{i}"``; per-algorithm mode: ``"fold_{i}_{alg}"``.
+    scoring : str or callable, default ``"MCC"``
+        Metric used both for early stopping during the reduction-pct sweep
+        and for picking the winning ``(fold, pct)`` per algorithm. Should
+        match the metric the HPO optimised. Recognised string aliases:
+        ``"MCC"``, ``"PR AUC"``, ``"ROC AUC"``, ``"KS"``, plus common
+        sklearn names (``"balanced_accuracy"``, ``"f1"``, ...).
     random_state : int, default 42
     outer_cv_groups : array-like, optional
         Group labels for the outer StratifiedGroupKFold.
@@ -895,6 +903,11 @@ def nested_crossval(
         compute_sample_weight(class_weight="balanced", y=y),
         index=y.index,
     )
+
+    # The early-stopping criterion and the final (fold, pct) ranking use
+    # the same metric the HPO optimised. Falls back to MCC for callable
+    # scorers or unrecognised strings.
+    metric_col = scoring_to_metric_column(scoring, default="MCC")
 
     if outer_cv_groups is not None:
         strat_kfold_outer = StratifiedGroupKFold(n_splits=4)
@@ -957,9 +970,9 @@ def nested_crossval(
 
     # ------------------------------------------------------------------ #
     # Incremental pct loop: parallel over active fold_keys per pct,     #
-    # with early stopping after two consecutive dips below best MCC.    #
+    # with early stopping after two consecutive dips below best score.  #
     # ------------------------------------------------------------------ #
-    best_mcc_es: dict = {fk: float("-inf") for fk in pipelines}
+    best_score_es: dict = {fk: float("-inf") for fk in pipelines}
     flagged_es: dict = {fk: False for fk in pipelines}
     active_es: dict = {fk: True for fk in pipelines}
     reduced_idx: dict = {}
@@ -1026,28 +1039,28 @@ def nested_crossval(
                 y_score=all_preds["score"] if "score" in all_preds.columns else None,
             )
             reports[(fold_key, pct)] = report
-            mcc = report["MCC"]
+            score_val = report[metric_col]
 
             if not flagged_es[fold_key]:
-                if mcc >= best_mcc_es[fold_key]:
-                    best_mcc_es[fold_key] = mcc
+                if score_val >= best_score_es[fold_key]:
+                    best_score_es[fold_key] = score_val
                 else:
                     flagged_es[fold_key] = True
                     print(
                         f"[nested_crossval] {fold_key!r} dip at {int(pct * 100)}%"
-                        f" (MCC={mcc:.4f} < best={best_mcc_es[fold_key]:.4f})"
+                        f" ({metric_col}={score_val:.4f} < best={best_score_es[fold_key]:.4f})"
                         " — giving one more chance …"
                     )
             else:
-                if mcc >= best_mcc_es[fold_key]:
+                if score_val >= best_score_es[fold_key]:
                     flagged_es[fold_key] = False
-                    best_mcc_es[fold_key] = mcc
+                    best_score_es[fold_key] = score_val
                 else:
                     active_es[fold_key] = False
                     flagged_es[fold_key] = False
                     print(
                         f"[nested_crossval] Early stop {fold_key!r} at {int(pct * 100)}%"
-                        f" (MCC={mcc:.4f} < best={best_mcc_es[fold_key]:.4f})"
+                        f" ({metric_col}={score_val:.4f} < best={best_score_es[fold_key]:.4f})"
                     )
 
     # ------------------------------------------------------------------ #
@@ -1072,11 +1085,11 @@ def nested_crossval(
         best_predictions = []
         for alg in algorithms:
             alg_df = validation.loc[alg]
-            best_fold_key, best_pct = alg_df["MCC"].idxmax()
-            best_mcc = alg_df.loc[(best_fold_key, best_pct), "MCC"]
+            best_fold_key, best_pct = alg_df[metric_col].idxmax()
+            best_score = alg_df.loc[(best_fold_key, best_pct), metric_col]
             print(
                 f"[nested_crossval] {alg}: best fold={best_fold_key!r} "
-                f"@ {int(best_pct * 100)}% (MCC={best_mcc:.4f}) "
+                f"@ {int(best_pct * 100)}% ({metric_col}={best_score:.4f}) "
                 f"— refitting …"
             )
             best_pipelines.append(
@@ -1094,7 +1107,7 @@ def nested_crossval(
             # its own best pct, concatenated across the n_splits test folds.
             alg_predictions = {}
             for fk in alg_df.index.get_level_values("fold").unique():
-                fk_best_pct = alg_df.loc[fk, "MCC"].idxmax()
+                fk_best_pct = alg_df.loc[fk, metric_col].idxmax()
                 alg_predictions[fk] = pd.concat(
                     [pred_store[(fk, si, fk_best_pct)] for si in range(n_splits)],
                     axis=0,
@@ -1112,11 +1125,11 @@ def nested_crossval(
         index=pd.MultiIndex.from_tuples(index_tuples, names=["fold", "reduction"]),
     )
 
-    best_fold, best_pct = validation["MCC"].idxmax()
-    best_mcc = validation.loc[(best_fold, best_pct), "MCC"]
+    best_fold, best_pct = validation[metric_col].idxmax()
+    best_score = validation.loc[(best_fold, best_pct), metric_col]
     print(
         f"[nested_crossval] Best: {best_fold!r} @ {int(best_pct * 100)}% "
-        f"(MCC={best_mcc:.4f}) — refitting …"
+        f"({metric_col}={best_score:.4f}) — refitting …"
     )
     best_model = _refit_pipeline(
         pipelines[best_fold],
@@ -1132,7 +1145,7 @@ def nested_crossval(
     # concatenated across the n_splits test folds.
     best_predictions = {}
     for fk in validation.index.get_level_values("fold").unique():
-        fk_best_pct = validation.loc[fk, "MCC"].idxmax()
+        fk_best_pct = validation.loc[fk, metric_col].idxmax()
         best_predictions[fk] = pd.concat(
             [pred_store[(fk, si, fk_best_pct)] for si in range(n_splits)],
             axis=0,
@@ -1231,6 +1244,7 @@ def magic_now(
         X=X,
         y=y,
         pipelines=pipelines,
+        scoring=scoring,
         outer_cv_groups=outer_cv_groups,
         n_jobs=n_jobs,
         algorithms=algorithm if per_alg_mode else None,

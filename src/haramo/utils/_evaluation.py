@@ -230,6 +230,32 @@ def resolve_scorer(scoring):
     return get_scorer(scoring)
 
 
+# Maps any accepted scoring identifier to the matching column in
+# ``classification_report``. Used by ``nested_crossval`` to rank
+# folds/reductions by the same metric the HPO optimised.
+_SCORING_TO_COLUMN = {
+    "MCC": "MCC",
+    "PR AUC": "PR AUC",
+    "ROC AUC": "ROC AUC",
+    "KS": "KS",
+    "balanced_accuracy": "Bal. Acc.",
+    "f1": "F1-score",
+    "precision": "Precision",
+    "recall": "Sensitivity",
+    "average_precision": "PR AUC",
+    "roc_auc": "ROC AUC",
+}
+
+
+def scoring_to_metric_column(scoring, default="MCC"):
+    """Map a ``scoring`` argument to the matching ``classification_report``
+    column name. Falls back to ``default`` for callables or unknown strings.
+    """
+    if callable(scoring):
+        return default
+    return _SCORING_TO_COLUMN.get(scoring, default)
+
+
 def classification_report(true_value, predicted_value, y_score=None):
     """Compute classification metrics for a binary problem.
 

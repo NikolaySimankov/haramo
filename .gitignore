@@ -51,12 +51,12 @@ coverage.xml
 .pytest_cache/
 cover/
 
-data/
-.dawgz/
-logs/
+local_test/
+catboost_info/
 *.tsv
 *.csv
 *.pkl
+*.pdf
 
 # Translations
 *.mo
