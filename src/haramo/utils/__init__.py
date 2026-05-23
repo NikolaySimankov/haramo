@@ -50,6 +50,7 @@ from ._calibration import (
     calibrate_pipeline,
     pick_best_calibration_method,
     find_best_threshold,
+    compute_calibration_variants,
     plot_calibration_curve,
 )
 
@@ -93,5 +94,6 @@ __all__ = [
     "calibrate_pipeline",
     "pick_best_calibration_method",
     "find_best_threshold",
+    "compute_calibration_variants",
     "plot_calibration_curve",
 ]

@@ -47,6 +47,7 @@ from ..utils import (
     calibrate_pipeline,
     pick_best_calibration_method,
     find_best_threshold,
+    compute_calibration_variants,
     ThresholdedClassifier,
 )
 from ..feature_selection import select_best_dataset_combo, select_best_feature_selector
@@ -1271,6 +1272,17 @@ def magic_now(
         algorithms=algorithm if per_alg_mode else None,
     )
 
+    # Keep a reference to the uncalibrated pipeline(s) for the calibration
+    # variants diagnostic plot. The `pipeline` variable below may be replaced
+    # by a CalibratedClassifierCV / ThresholdedClassifier wrapper.
+    uncalibrated_pipeline = list(pipeline) if per_alg_mode else pipeline
+
+    # Computed once and reused by both the calibration block (if enabled)
+    # and the calibration variants plot.
+    sample_weight = pd.Series(
+        compute_sample_weight(class_weight="balanced", y=y), index=y.index,
+    )
+
     # ---------------------------------------------------------------------#
     # Optional calibration + threshold tuning on the winning pipeline(s). #
     # HPO loops are untouched; this only adds a handful of fits at the    #
@@ -1278,9 +1290,6 @@ def magic_now(
     # uncalibrated OOF predictions from nested_crossval (free).           #
     # ---------------------------------------------------------------------#
     if calibration is not None or optimize_threshold:
-        sample_weight = pd.Series(
-            compute_sample_weight(class_weight="balanced", y=y), index=y.index,
-        )
 
         def _calibrate_and_threshold(pipe, oof_df, label):
             method = None
@@ -1358,7 +1367,9 @@ def magic_now(
     # ---------------------------------------------------------------------#
     if plots:
         if per_alg_mode:
-            for alg, preds in zip(algorithm, predictions):
+            for alg, preds, uncal_pipe in zip(
+                algorithm, predictions, uncalibrated_pipeline
+            ):
                 plot_pr_curve(
                     preds,
                     plots_dir / f"pr_curve_{alg}{tag}.pdf",
@@ -1374,10 +1385,13 @@ def magic_now(
                     plots_dir / f"ks_statistic_{alg}{tag}.pdf",
                     title=f"KS statistic — {alg}",
                 )
+                variants = compute_calibration_variants(
+                    uncal_pipe, X, y, sample_weight, random_state=random_state
+                )
                 plot_calibration_curve(
-                    preds,
+                    variants,
                     plots_dir / f"calibration_curve_{alg}{tag}.pdf",
-                    title=f"Calibration curve — {alg}",
+                    title=f"Calibration plots — {alg}",
                 )
         else:
             plot_pr_curve(predictions, plots_dir / f"pr_curve{tag}.pdf", title="PR curve")
@@ -1385,10 +1399,13 @@ def magic_now(
             plot_ks_statistic(
                 predictions, plots_dir / f"ks_statistic{tag}.pdf", title="KS statistic"
             )
+            variants = compute_calibration_variants(
+                uncalibrated_pipeline, X, y, sample_weight, random_state=random_state
+            )
             plot_calibration_curve(
-                predictions,
+                variants,
                 plots_dir / f"calibration_curve{tag}.pdf",
-                title="Calibration curve",
+                title="Calibration plots",
             )
 
     n_1 = int((y == 1).sum())

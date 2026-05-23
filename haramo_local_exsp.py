@@ -92,11 +92,11 @@ if __name__ == "__main__":
     # Split comma-separated values and remove duplicates
     proteins = [
         # "DNA replication protein",
-        # "RNA-dependent RNA polymerase",
+        "RNA-dependent RNA polymerase",
         # "DNA-RNA polymerase superfamily",
         # "Reverse transcriptase",
         # "Coat protein",
-        # "Movement protein",
+        "Movement protein",
         # "Transactivator-Viroplasmin protein",
         "RNA silencing suppressor",
         # "Vector transmission protein",
@@ -160,5 +160,5 @@ if __name__ == "__main__":
                 tag=f"_{protein}_{target}",
                 n_jobs=12,
                 calibration="auto",
-                optimize_threshold=True,
+                optimize_threshold=False,
             )

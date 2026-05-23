@@ -146,47 +146,103 @@ def find_best_threshold(y_true, y_score, metric="MCC", n_thresholds=101):
     return float(thresholds[best_idx]), float(scores[best_idx])
 
 
-def plot_calibration_curve(predictions_by_model, output_path, title=None, n_bins=10):
-    """Reliability diagram per outer-fold model + mean curve with std band.
+def _proba_for_display(estimator, X):
+    """Return positive-class probabilities for an estimator.
+
+    Falls back to a min-max-scaled ``decision_function`` (mirrors the
+    ``NaivelyCalibratedLinearSVC`` pattern) when ``predict_proba`` is missing,
+    so the uncalibrated curve still has something to plot for Ridge/SGD.
+    """
+    if hasattr(estimator, "predict_proba"):
+        return estimator.predict_proba(X)[:, 1]
+    if hasattr(estimator, "decision_function"):
+        df = estimator.decision_function(X)
+        denom = df.max() - df.min()
+        if denom <= 0:
+            return np.full_like(df, 0.5, dtype=float)
+        return np.clip((df - df.min()) / denom, 0.0, 1.0)
+    raise ValueError(
+        "Estimator has neither predict_proba nor decision_function"
+    )
+
+
+def compute_calibration_variants(
+    pipeline, X, y, sample_weight=None, random_state=42, test_size=0.2
+):
+    """Fit pipeline + isotonic + sigmoid variants on a single 80/20 holdout.
+
+    Returns a dict mapping variant name to ``{"y_true": array, "y_score":
+    array}``, suitable for :func:`plot_calibration_curve`. Cheap diagnostic
+    — ~5 fits total (1 uncalibrated + 2 × cv=2 calibrated).
+    """
+    split_kwargs = dict(test_size=test_size, stratify=y, random_state=random_state)
+    if sample_weight is not None:
+        X_tr, X_te, y_tr, y_te, sw_tr, _ = train_test_split(
+            X, y, sample_weight, **split_kwargs
+        )
+    else:
+        X_tr, X_te, y_tr, y_te = train_test_split(X, y, **split_kwargs)
+        sw_tr = None
+
+    variants = {}
+
+    uncal = clone(pipeline)
+    try:
+        uncal.fit(X_tr, y_tr, model__sample_weight=sw_tr)
+    except (TypeError, ValueError):
+        uncal.fit(X_tr, y_tr)
+    variants["No calibration"] = {
+        "y_true": np.asarray(y_te).astype(int),
+        "y_score": _proba_for_display(uncal, X_te),
+    }
+
+    for method, label in (("isotonic", "Isotonic"), ("sigmoid", "Sigmoid")):
+        cal = CalibratedClassifierCV(clone(pipeline), cv=2, method=method)
+        try:
+            cal.fit(X_tr, y_tr, sample_weight=sw_tr)
+        except (TypeError, ValueError):
+            cal.fit(X_tr, y_tr)
+        variants[label] = {
+            "y_true": np.asarray(y_te).astype(int),
+            "y_score": cal.predict_proba(X_te)[:, 1],
+        }
+
+    return variants
+
+
+def plot_calibration_curve(variants, output_path, title=None, n_bins=10):
+    """Side-by-side calibration plot for {uncalibrated, isotonic, sigmoid}.
 
     Parameters
     ----------
-    predictions_by_model : dict[str, pd.DataFrame]
-        Mapping ``model_key -> DataFrame`` with columns
-        ``["true", "predicted", "score"]``. Score values must be probabilities
-        in ``[0, 1]``; models whose score column lies outside that range
-        (e.g. decision_function fallback) are silently skipped.
+    variants : dict[str, dict]
+        Mapping ``variant_name -> {"y_true": array, "y_score": array}``.
+        One curve per variant; the Brier score is computed on each variant's
+        scores and displayed in the legend.
     output_path : path-like
     title : str, optional
     n_bins : int, default 10
     """
     fig, ax = plt.subplots(figsize=(6, 6))
-    grid = np.linspace(0, 1, n_bins)
-    per_model = []
+    colors = {"No calibration": "tab:red", "Isotonic": "tab:green",
+              "Sigmoid": "tab:blue"}
 
-    for model_key, df in sorted(predictions_by_model.items()):
-        y_true = df["true"].to_numpy().astype(int)
-        y_score = df["score"].to_numpy(dtype=float)
-        if y_score.size == 0 or y_score.min() < 0 or y_score.max() > 1:
+    for name, data in variants.items():
+        y_true = np.asarray(data["y_true"]).astype(int)
+        y_score = np.asarray(data["y_score"], dtype=float)
+        if y_score.size == 0:
             continue
+        # Clip to [0,1] defensively; calibrated outputs are already there,
+        # the uncalibrated min-max-scaled decision_function path is too.
+        y_score = np.clip(y_score, 0.0, 1.0)
         prob_true, prob_pred = calibration_curve(
             y_true, y_score, n_bins=n_bins, strategy="quantile"
         )
-        per_model.append((prob_pred, prob_true))
+        brier = brier_score_loss(y_true, y_score)
         ax.plot(
-            prob_pred, prob_true, marker="o", alpha=0.4, lw=1,
-            label=f"{model_key}",
-        )
-
-    if per_model:
-        interp = np.asarray([np.interp(grid, x, y) for x, y in per_model])
-        mean_c, std_c = interp.mean(axis=0), interp.std(axis=0)
-        ax.plot(grid, mean_c, color="b", lw=2, label="Mean")
-        ax.fill_between(
-            grid,
-            np.clip(mean_c - std_c, 0, 1),
-            np.clip(mean_c + std_c, 0, 1),
-            color="grey", alpha=0.2, label=r"$\pm$ 1 std. dev.",
+            prob_pred, prob_true, marker="o", lw=1.5,
+            color=colors.get(name),
+            label=f"{name} ({brier:.3f})",
         )
 
     ax.plot(
@@ -196,7 +252,7 @@ def plot_calibration_curve(predictions_by_model, output_path, title=None, n_bins
     ax.set(
         xlabel="Mean predicted probability", ylabel="Fraction of positives",
         xlim=(-0.01, 1.01), ylim=(-0.01, 1.01),
-        title=title or "Calibration curve (outer-fold models)",
+        title=title or "Calibration plots (Brier in legend)",
     )
     ax.legend(loc="lower right", fontsize=8)
     ax.grid(True, alpha=0.3)
