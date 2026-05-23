@@ -18,6 +18,7 @@ from sklearn.utils.class_weight import compute_sample_weight
 from sklearn.model_selection import (
     StratifiedKFold,
     StratifiedGroupKFold,
+    cross_val_predict,
 )
 from sklearn.svm import SVC
 
@@ -42,6 +43,11 @@ from ..utils import (
     plot_pr_curve,
     plot_roc_curve,
     plot_ks_statistic,
+    plot_calibration_curve,
+    calibrate_pipeline,
+    pick_best_calibration_method,
+    find_best_threshold,
+    ThresholdedClassifier,
 )
 from ..feature_selection import select_best_dataset_combo, select_best_feature_selector
 
@@ -1177,10 +1183,19 @@ def magic_now(
     tag: str = "",
     n_jobs: int = 12,
     plots: bool = True,
+    calibration: Union[str, None] = None,
+    optimize_threshold: bool = False,
+    threshold_metric: str = "MCC",
 ):
 
     if not output_dir:
         raise ValueError("Output directory must be specified.")
+
+    if calibration not in (None, "isotonic", "sigmoid", "auto"):
+        raise ValueError(
+            f"calibration must be None, 'isotonic', 'sigmoid', or 'auto' "
+            f"(got {calibration!r})"
+        )
 
     results_dir = output_dir / "results"
     results_dir.mkdir(exist_ok=True)
@@ -1257,6 +1272,69 @@ def magic_now(
     )
 
     # ---------------------------------------------------------------------#
+    # Optional calibration + threshold tuning on the winning pipeline(s). #
+    # HPO loops are untouched; this only adds a handful of fits at the    #
+    # end of the run. When calibration is off, threshold tuning uses the  #
+    # uncalibrated OOF predictions from nested_crossval (free).           #
+    # ---------------------------------------------------------------------#
+    if calibration is not None or optimize_threshold:
+        sample_weight = pd.Series(
+            compute_sample_weight(class_weight="balanced", y=y), index=y.index,
+        )
+
+        def _calibrate_and_threshold(pipe, oof_df, label):
+            method = None
+            if calibration == "auto":
+                method, brier = pick_best_calibration_method(
+                    pipe, X, y, sample_weight, random_state=random_state
+                )
+                print(
+                    f"[magic_now] {label}: auto-picked calibration={method!r} "
+                    f"(Brier={brier:.4f})."
+                )
+            elif calibration in ("isotonic", "sigmoid"):
+                method = calibration
+
+            if method is not None:
+                pipe = calibrate_pipeline(
+                    pipe, X, y, sample_weight, method=method, cv=3
+                )
+                print(f"[magic_now] {label}: calibrated ({method}).")
+
+            if optimize_threshold:
+                if method is not None:
+                    # OOF calibrated probas via cv=3 cross_val_predict.
+                    proba = cross_val_predict(
+                        clone(pipe), X, y, cv=3,
+                        method="predict_proba", n_jobs=n_jobs,
+                    )[:, 1]
+                    y_true_arr = np.asarray(y)
+                    y_score_arr = proba
+                else:
+                    y_true_arr = oof_df["true"].to_numpy()
+                    y_score_arr = oof_df["score"].to_numpy()
+                t, t_score = find_best_threshold(
+                    y_true_arr, y_score_arr, metric=threshold_metric
+                )
+                pipe = ThresholdedClassifier(pipe, threshold=t)
+                print(
+                    f"[magic_now] {label}: threshold={t:.3f} "
+                    f"({threshold_metric}={t_score:.4f})."
+                )
+            return pipe
+
+        if per_alg_mode:
+            pipeline = [
+                _calibrate_and_threshold(
+                    pipe, pd.concat(list(preds.values()), axis=0), alg
+                )
+                for alg, pipe, preds in zip(algorithm, pipeline, predictions)
+            ]
+        else:
+            oof = pd.concat(list(predictions.values()), axis=0)
+            pipeline = _calibrate_and_threshold(pipeline, oof, "single")
+
+    # ---------------------------------------------------------------------#
     # Persist pipelines                                                    #
     # Per-algorithm mode: one file per algorithm named pipelines_{alg}.pkl #
     # Single mode: one file named pipelines.pkl (unchanged)                #
@@ -1296,11 +1374,21 @@ def magic_now(
                     plots_dir / f"ks_statistic_{alg}{tag}.pdf",
                     title=f"KS statistic — {alg}",
                 )
+                plot_calibration_curve(
+                    preds,
+                    plots_dir / f"calibration_curve_{alg}{tag}.pdf",
+                    title=f"Calibration curve — {alg}",
+                )
         else:
             plot_pr_curve(predictions, plots_dir / f"pr_curve{tag}.pdf", title="PR curve")
             plot_roc_curve(predictions, plots_dir / f"roc_curve{tag}.pdf", title="ROC curve")
             plot_ks_statistic(
                 predictions, plots_dir / f"ks_statistic{tag}.pdf", title="KS statistic"
+            )
+            plot_calibration_curve(
+                predictions,
+                plots_dir / f"calibration_curve{tag}.pdf",
+                title="Calibration curve",
             )
 
     n_1 = int((y == 1).sum())

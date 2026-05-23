@@ -159,4 +159,6 @@ if __name__ == "__main__":
                 plots=True,
                 tag=f"_{protein}_{target}",
                 n_jobs=12,
+                calibration="auto",
+                optimize_threshold=True,
             )

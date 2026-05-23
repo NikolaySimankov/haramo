@@ -45,6 +45,14 @@ from ._dataset_reducer import (
     stage2_refine,
 )
 
+from ._calibration import (
+    ThresholdedClassifier,
+    calibrate_pipeline,
+    pick_best_calibration_method,
+    find_best_threshold,
+    plot_calibration_curve,
+)
+
 __all__ = [
     "set_verbosity",
     "detect_dtype",
@@ -81,4 +89,9 @@ __all__ = [
     "reduce_dataset",
     "stage1_reduce",
     "stage2_refine",
+    "ThresholdedClassifier",
+    "calibrate_pipeline",
+    "pick_best_calibration_method",
+    "find_best_threshold",
+    "plot_calibration_curve",
 ]
