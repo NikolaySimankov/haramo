@@ -454,7 +454,7 @@ def _train_fold(
     )
 
     # ------------------------------------------------------------------ #
-    # Build final pipeline: FS steps (phase 1) + scaler + model (phase 2) #
+    # Build final pipeline: FS steps (phase 1) + scaler + model (phase 2)#
     # ------------------------------------------------------------------ #
     phase2_pipeline = instantiate_pipeline(
         trial=study.best_trial,
@@ -520,7 +520,7 @@ def _train_fold_multi_alg(
         groups_train = None
 
     # ------------------------------------------------------------------ #
-    # Phase 1 – feature-selection HPO (shared across all algorithms)      #
+    # Phase 1 – feature-selection HPO (shared across all algorithms)     #
     # ------------------------------------------------------------------ #
     fs_pipeline = select_best_feature_selector(
         X_train=X_train,
@@ -536,7 +536,7 @@ def _train_fold_multi_alg(
     X_test_sel = fs_pipeline.transform(X_test)
 
     # ------------------------------------------------------------------ #
-    # Phase 2 – one Optuna study per algorithm                            #
+    # Phase 2 – one Optuna study per algorithm                           #
     # ------------------------------------------------------------------ #
     if n_cv_jobs < 2:
         _model_jobs, _inner_jobs = n_cv_jobs, 1
@@ -917,7 +917,9 @@ def nested_crossval(
     # scorers or unrecognised strings.
     metric_col = scoring_to_metric_column(scoring, default="MCC")
     lower_better = metric_is_lower_better(metric_col)
-    _is_better = (lambda new, cur: new <= cur) if lower_better else (lambda new, cur: new >= cur)
+    _is_better = (
+        (lambda new, cur: new <= cur) if lower_better else (lambda new, cur: new >= cur)
+    )
     _idxbest = (lambda s: s.idxmin()) if lower_better else (lambda s: s.idxmax())
     _worst_init = float("inf") if lower_better else float("-inf")
 
@@ -934,7 +936,7 @@ def nested_crossval(
     n_splits = len(splits)
 
     # ------------------------------------------------------------------ #
-    # Valid reduction percentages                                          #
+    # Valid reduction percentages                                        #
     # ------------------------------------------------------------------ #
     all_percentages = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
     min_size = 2000
@@ -981,8 +983,8 @@ def nested_crossval(
     )
 
     # ------------------------------------------------------------------ #
-    # Incremental pct loop: parallel over active fold_keys per pct,     #
-    # with early stopping after two consecutive dips below best score.  #
+    # Incremental pct loop: parallel over active fold_keys per pct,      #
+    # with early stopping after two consecutive dips below best score.   #
     # ------------------------------------------------------------------ #
     best_score_es: dict = {fk: _worst_init for fk in pipelines}
     flagged_es: dict = {fk: False for fk in pipelines}
@@ -1130,7 +1132,7 @@ def nested_crossval(
         return validation, best_pipelines, best_predictions
 
     # ------------------------------------------------------------------ #
-    # Single-algorithm mode                                                #
+    # Single-algorithm mode                                              #
     # ------------------------------------------------------------------ #
     index_tuples = list(reports.keys())
     validation = pd.DataFrame(
@@ -1280,62 +1282,99 @@ def magic_now(
     # Computed once and reused by both the calibration block (if enabled)
     # and the calibration variants plot.
     sample_weight = pd.Series(
-        compute_sample_weight(class_weight="balanced", y=y), index=y.index,
+        compute_sample_weight(class_weight="balanced", y=y),
+        index=y.index,
     )
 
     # ---------------------------------------------------------------------#
-    # Optional calibration + threshold tuning on the winning pipeline(s). #
-    # HPO loops are untouched; this only adds a handful of fits at the    #
-    # end of the run. When calibration is off, threshold tuning uses the  #
-    # uncalibrated OOF predictions from nested_crossval (free).           #
+    # Optional calibration + threshold tuning on the winning pipeline(s).  #
+    # HPO loops are untouched; this only adds a handful of fits at the     #
+    # end of the run. When calibration is off, threshold tuning uses the   #
+    # uncalibrated OOF predictions from nested_crossval (free).            #
     # ---------------------------------------------------------------------#
     if calibration is not None or optimize_threshold:
 
+        def _make_cv():
+            if outer_cv_groups is not None:
+                return StratifiedGroupKFold(n_splits=4).split(
+                    X, y.astype("str"), groups=outer_cv_groups
+                )
+            return StratifiedKFold(
+                n_splits=4,
+                shuffle=True,
+                random_state=random_state,
+            ).split(X, y.astype("str"))
+
         def _calibrate_and_threshold(pipe, oof_df, label):
-            method = None
+            calibrated_method = None
+
             if calibration == "auto":
-                method, brier = pick_best_calibration_method(
-                    pipe, X, y, sample_weight, random_state=random_state
+                calibrated_method, brier = pick_best_calibration_method(
+                    pipe,
+                    X,
+                    y,
+                    sample_weight,
+                    random_state=random_state,
                 )
                 print(
-                    f"[magic_now] {label}: auto-picked calibration={method!r} "
-                    f"(Brier={brier:.4f})."
+                    f"[magic_now] {label}: auto-picked calibration="
+                    f"{calibrated_method!r} (Brier={brier:.4f})."
                 )
-            elif calibration in ("isotonic", "sigmoid"):
-                method = calibration
 
-            if method is not None:
+            elif calibration in ("isotonic", "sigmoid"):
+                calibrated_method = calibration
+
+            if calibrated_method is not None:
                 pipe = calibrate_pipeline(
-                    pipe, X, y, sample_weight, method=method, cv=3
+                    pipe,
+                    X,
+                    y,
+                    sample_weight,
+                    method=calibrated_method,
+                    cv=4,
                 )
-                print(f"[magic_now] {label}: calibrated ({method}).")
+                print(f"[magic_now] {label}: calibrated ({calibrated_method}).")
 
             if optimize_threshold:
-                if method is not None:
-                    # OOF calibrated probas via cv=3 cross_val_predict.
-                    proba = cross_val_predict(
-                        clone(pipe), X, y, cv=3,
-                        method="predict_proba", n_jobs=n_jobs,
+                if calibrated_method is not None:
+                    cv = list(_make_cv())
+
+                    y_score_arr = cross_val_predict(
+                        clone(pipe),
+                        X,
+                        y,
+                        cv=cv,
+                        method="predict_proba",
+                        n_jobs=n_jobs,
                     )[:, 1]
+
                     y_true_arr = np.asarray(y)
-                    y_score_arr = proba
+
                 else:
                     y_true_arr = oof_df["true"].to_numpy()
                     y_score_arr = oof_df["score"].to_numpy()
-                t, t_score = find_best_threshold(
-                    y_true_arr, y_score_arr, metric=threshold_metric
+
+                threshold, threshold_score = find_best_threshold(
+                    y_true_arr,
+                    y_score_arr,
+                    metric=threshold_metric,
                 )
-                pipe = ThresholdedClassifier(pipe, threshold=t)
+
+                pipe = ThresholdedClassifier(pipe, threshold=threshold)
+
                 print(
-                    f"[magic_now] {label}: threshold={t:.3f} "
-                    f"({threshold_metric}={t_score:.4f})."
+                    f"[magic_now] {label}: threshold={threshold:.3f} "
+                    f"({threshold_metric}={threshold_score:.4f})."
                 )
+
             return pipe
 
         if per_alg_mode:
             pipeline = [
                 _calibrate_and_threshold(
-                    pipe, pd.concat(list(preds.values()), axis=0), alg
+                    pipe,
+                    pd.concat(list(preds.values()), axis=0),
+                    alg,
                 )
                 for alg, pipe, preds in zip(algorithm, pipeline, predictions)
             ]
@@ -1348,6 +1387,7 @@ def magic_now(
     # Per-algorithm mode: one file per algorithm named pipelines_{alg}.pkl #
     # Single mode: one file named pipelines.pkl (unchanged)                #
     # ---------------------------------------------------------------------#
+
     if per_alg_mode:
         for alg, pipe in zip(algorithm, pipeline):
             with open(models_dir / f"pipelines_{alg}{tag}.pkl", "wb") as handle:
@@ -1363,8 +1403,9 @@ def magic_now(
         pickle.dump(studies, handle)
 
     # ---------------------------------------------------------------------#
-    # PR / ROC curve plots — one curve per outer-fold model, mean +/- std #
+    # PR / ROC curve plots — one curve per outer-fold model, mean +/- std  #
     # ---------------------------------------------------------------------#
+
     if plots:
         if per_alg_mode:
             for alg, preds, uncal_pipe in zip(
@@ -1394,8 +1435,12 @@ def magic_now(
                     title=f"Calibration plots — {alg}",
                 )
         else:
-            plot_pr_curve(predictions, plots_dir / f"pr_curve{tag}.pdf", title="PR curve")
-            plot_roc_curve(predictions, plots_dir / f"roc_curve{tag}.pdf", title="ROC curve")
+            plot_pr_curve(
+                predictions, plots_dir / f"pr_curve{tag}.pdf", title="PR curve"
+            )
+            plot_roc_curve(
+                predictions, plots_dir / f"roc_curve{tag}.pdf", title="ROC curve"
+            )
             plot_ks_statistic(
                 predictions, plots_dir / f"ks_statistic{tag}.pdf", title="KS statistic"
             )
@@ -1421,6 +1466,7 @@ def magic_now(
     # ---------------------------------------------------------------------#
     # Best hyperparameters per algorithm                                   #
     # ---------------------------------------------------------------------#
+
     if per_alg_mode:
         best_params_rows = []
         for alg in algorithm:

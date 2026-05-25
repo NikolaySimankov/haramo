@@ -210,7 +210,7 @@ def compute_calibration_variants(
     return variants
 
 
-def plot_calibration_curve(variants, output_path, title=None, n_bins=10):
+def plot_calibration_curve(variants, output_path, title=None, n_bins=5):
     """Side-by-side calibration plot for {uncalibrated, isotonic, sigmoid}.
 
     Parameters
@@ -221,7 +221,11 @@ def plot_calibration_curve(variants, output_path, title=None, n_bins=10):
         scores and displayed in the legend.
     output_path : path-like
     title : str, optional
-    n_bins : int, default 10
+    n_bins : int, default 5
+        Number of equal-width bins across ``[0, 1]``. Combined with the
+        ``"uniform"`` strategy below, this exposes confidence pile-ups
+        (large empty bins between rare points) rather than collapsing
+        well-separated models into 3–4 quantile-clustered points.
     """
     fig, ax = plt.subplots(figsize=(6, 6))
     colors = {"No calibration": "tab:red", "Isotonic": "tab:green",
@@ -236,7 +240,7 @@ def plot_calibration_curve(variants, output_path, title=None, n_bins=10):
         # the uncalibrated min-max-scaled decision_function path is too.
         y_score = np.clip(y_score, 0.0, 1.0)
         prob_true, prob_pred = calibration_curve(
-            y_true, y_score, n_bins=n_bins, strategy="quantile"
+            y_true, y_score, n_bins=n_bins, strategy="uniform"
         )
         brier = brier_score_loss(y_true, y_score)
         ax.plot(
