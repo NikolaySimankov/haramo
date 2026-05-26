@@ -47,6 +47,121 @@ Takes the top pipeline structures identified in stage 1 and runs Bayesian (`TPES
 
 ---
 
+## Pipeline overview
+
+End-to-end view of what `magic_now` does on each call.
+
+```
+magic_now(X, y, scoring="PR AUC", calibration="auto"|"isotonic"|"sigmoid"|None,
+          optimize_threshold=True|False, pos_weight_factor=1.0, ...)
+│
+├── [Optional] Dataset combo selection      (only when X is a list/dict of DataFrames)
+│      └── beam search over candidate DataFrames → concatenated best combo
+│
+├── Compute sample_weight
+│      └── balanced class weights × pos_weight_factor on the positive class
+│
+├── train()                                  ← outer CV: 4-fold Stratified[Group]KFold (random_state)
+│      │
+│      └── For each outer fold (in parallel):
+│             │
+│             ├── Phase 1 — Feature-selection HPO
+│             │      └── 5/10/15 Optuna trials × inner 3-fold CV
+│             │             → fit-fixed (StandardScaler + default LGBM) → best FS pipeline
+│             │
+│             └── Phase 2 — Scaler + model HPO
+│                    └── n_trials Optuna trials × inner 3-fold CV
+│                           → tunes scaler, algorithm (if list ⇒ categorical), hyperparams
+│                           → study.best_params
+│
+│      Output: pipelines = {fold_1: pipeline, fold_2: pipeline, fold_3: pipeline, fold_4: pipeline}
+│              studies   = {fold_i: optuna study}
+│
+├── nested_crossval()                        ← per-fold reduction-pct sweep + dual evaluation
+│      │
+│      ├── Build TWO CV grids:
+│      │      ├── tts_splits  (random_state)        ← same grid train() used; each fold's "true" held-out fold
+│      │      └── cfc_splits  (cfc_random_state)    ← independent neutral grid for cross-fold comparison
+│      │
+│      ├── For each valid reduction pct (10%–100%, filtered by ≥2000 samples & SVM cap):
+│      │      │
+│      │      ├── CFC fits  — every fold_key × every cfc_split → pred_store_cfc[fk, si, pct]
+│      │      ├── TTS fits  — every fold_key on its own tts_split[i] → pred_store_tts[fk, pct]
+│      │      │
+│      │      ├── Combined report per fold_key:
+│      │      │      ├── CFC report  ⟶ "{metric} CFC" columns (concatenated across cfc_splits)
+│      │      │      └── TTS report  ⟶ "{metric} TTS" columns (single OOF held-out fold)
+│      │      │
+│      │      └── Early stopping per fold_key on "{scoring} CFC"  (2-strike rule)
+│      │
+│      └── For each fold_key:
+│             ├── Pick best pct by "{scoring} CFC"            ← per-fold, NOT cross-fold winner
+│             ├── Refit pipeline on full data at best pct
+│             └── Surface OOF preds:  {"cfc": concat over cfc_splits, "tts": single tts_split}
+│
+│      Output: reduction_validation     (MultiIndex (fold, reduction); CFC+TTS columns)
+│              pipeline_by_fold         (dict {fold_key: refitted Pipeline})
+│              predictions_by_fold      (dict {fold_key: {"cfc": df, "tts": df}})
+│
+├── [Optional] Score-level calibration + threshold tuning
+│      │      (zero extra model fits — operates entirely on the OOF scores already produced)
+│      │
+│      └── For each fold:
+│             ├── Pick calibration method:
+│             │      ├── calibration="auto"     → pick_best_score_calibration_method (k-fold on CFC OOF, Brier)
+│             │      ├── calibration="isotonic" → ScoreCalibrator(method="isotonic")
+│             │      ├── calibration="sigmoid"  → ScoreCalibrator(method="sigmoid")
+│             │      └── calibration=None       → no calibrator
+│             │
+│             ├── Fit ScoreCalibrator on CFC OOF (y_true, y_score)
+│             ├── Apply calibrator to CFC scores and TTS scores  ⟶ calibrated probabilities
+│             │
+│             ├── If optimize_threshold:
+│             │      └── find_best_threshold on calibrated CFC scores
+│             │             ├── metric = scoring   (or "FNFP Loss" fallback for threshold-free)
+│             │             └── lower/upper-better aware (Brier, FNFP Loss → argmin)
+│             │
+│             ├── Build per-variant rows in the final validation table:
+│             │      ├── "raw model"                          — raw scores, threshold 0.5
+│             │      ├── "calibrated model"                   — calibrated scores, threshold 0.5
+│             │      └── "calibrated model with threshold"    — calibrated + tuned threshold
+│             │      (every row carries both "{metric} CFC" and "{metric} TTS" columns)
+│             │
+│             └── Wrap (pipeline, calibrator, threshold) in CalibratedThresholdedClassifier
+│
+├── Persist
+│      ├── models/pipelines{tag}.pkl            ← {fold_key: CalibratedThresholdedClassifier | Pipeline}
+│      ├── trials/studies{tag}.pkl              ← Optuna studies
+│      ├── results/best_params{tag}.tsv         ← per-fold HPO winner (algorithm + hyperparams)
+│      ├── results/validation{tag}.tsv          ← per-fold per-variant; CFC + TTS columns
+│      ├── results/reduction_validation{tag}.tsv← full nested_crossval table
+│      └── results/dataset_selection{tag}.tsv   ← (if dataset combo selection ran)
+│
+└── Plots (if plots=True):
+       ├── plots/pr_curve{tag}.pdf              ← one CFC curve per fold + mean ± std
+       ├── plots/roc_curve{tag}.pdf
+       ├── plots/ks_statistic{tag}.pdf
+       └── plots/calibration_curve_{fold}{tag}.pdf
+              (uncalibrated vs isotonic vs sigmoid, Brier in legend, per outer fold)
+
+
+Deployment / inference
+======================
+art = pickle.load(open("pipelines{tag}.pkl"))["fold_1"]
+y_proba = art.predict_proba(X_new)[:, 1]      ← pipeline.predict_proba → ScoreCalibrator → clip[0,1]
+y_pred  = art.predict(X_new)                  ← (y_proba >= art.threshold).astype(int)
+```
+
+### Key invariants
+
+- **HPO loop is calibration-free.** Phase 1 + Phase 2 inside `train()` never see calibration or threshold tuning. The scorer (e.g. PR AUC, FNFP Loss) drives Optuna directly. Keeps per-trial cost stable and predictable.
+- **CFC drives selection, TTS is diagnostic.** Reduction-pct selection, early stopping, and calibration-method picking all key off CFC (more data per evaluation, lower variance). TTS metrics appear in the same row for comparison but never determine winners.
+- **Per-fold, not cross-fold.** Every outer fold's pipeline is refit at its own best pct, calibrated against its own OOF, gets its own threshold, and is shipped as one entry in the pickled dict. There is no single "winner" — N independent deployable artifacts, plus a validation table that lets you pick by mean(CFC,TTS), stability, or any other rule downstream.
+- **`scoring` controls four things:** the Optuna objective in Phase 1/Phase 2 HPO, the early-stopping criterion in `nested_crossval`, the per-fold best-pct selection in `nested_crossval`, and the threshold-tuning metric in `find_best_threshold` (with `"FNFP Loss"` fallback when `scoring` is threshold-free).
+- **`pos_weight_factor` threads everywhere `sample_weight` is used:** HPO inner CV fits, nested_crossval fits, calibrator fit on OOF scores. Default `1.0` is balanced; higher values prioritize sensitivity.
+
+---
+
 ## Quick start
 
 ```python

@@ -491,158 +491,6 @@ def _train_fold(
     return fold_name, final_pipeline, study
 
 
-def _train_fold_multi_alg(
-    fold_idx,
-    X,
-    y,
-    sample_weight,
-    train_index,
-    test_index,
-    scoring,
-    task,
-    feature_selector,
-    scaler,
-    algorithms,
-    n_trials_per_alg,
-    n_cv_jobs,
-    random_state,
-    inner_cv_groups=None,
-):
-    """
-    Two-phase optimisation for one outer fold when a list of algorithms is
-    provided with ``hyperparameters="optimize"``.
-
-    Phase 1 – Feature-selection HPO runs **once** for the fold, shared across
-    all algorithms so FS is not duplicated for each model.
-
-    Phase 2 – One independent Optuna study per algorithm, each with
-    ``n_trials_per_alg`` trials on the pre-selected feature matrix.
-
-    Returns
-    -------
-    list of (name, pipeline, study)
-        One entry per algorithm; name = ``fold_{fold_idx}_{alg}``.
-    """
-    X_train, X_test = X.iloc[train_index], X.iloc[test_index]
-    y_train, y_test = y.iloc[train_index], y.iloc[test_index]
-    w_train = sample_weight.loc[y_train.index]
-
-    if inner_cv_groups is not None:
-        groups_s = (
-            inner_cv_groups
-            if isinstance(inner_cv_groups, pd.Series)
-            else pd.Series(inner_cv_groups, index=y.index)
-        )
-        groups_train = groups_s.iloc[train_index]
-    else:
-        groups_train = None
-
-    # ------------------------------------------------------------------ #
-    # Phase 1 – feature-selection HPO (shared across all algorithms)     #
-    # ------------------------------------------------------------------ #
-    fs_pipeline = select_best_feature_selector(
-        X_train=X_train,
-        y_train=y_train,
-        feature_selector=feature_selector,
-        task=task,
-        scoring=scoring,
-        random_state=random_state,
-        inner_cv_groups=groups_train,
-        n_jobs=n_cv_jobs,
-    )
-    X_train_sel = fs_pipeline.transform(X_train)
-    X_test_sel = fs_pipeline.transform(X_test)
-
-    # ------------------------------------------------------------------ #
-    # Phase 2 – one Optuna study per algorithm                           #
-    # ------------------------------------------------------------------ #
-    if n_cv_jobs < 2:
-        _model_jobs, _inner_jobs = n_cv_jobs, 1
-    elif n_cv_jobs == 3:
-        _model_jobs, _inner_jobs = 1, n_cv_jobs
-    elif n_cv_jobs < 6:
-        _model_jobs, _inner_jobs = n_cv_jobs, 1
-    else:
-        _model_jobs, _inner_jobs = n_cv_jobs // 3, 3
-
-    # Pre-compute inner CV splits and reduced indices once; shared across all algorithms
-    if groups_train is not None:
-        _p2_splits = list(
-            StratifiedGroupKFold(n_splits=3).split(
-                X_train_sel, y_train.astype("str"), groups=groups_train
-            )
-        )
-    else:
-        _p2_splits = list(
-            StratifiedKFold(n_splits=3, shuffle=True, random_state=random_state).split(
-                X_train_sel, y_train.astype("str")
-            )
-        )
-    _p2_reduced = [
-        reduce_dataset(
-            X=X_train_sel.iloc[tr],
-            y=y_train.iloc[tr],
-            target_size=2000,
-            stage2_shrink=1,
-            class_weight="balanced",
-            random_state=random_state,
-            verbose=False,
-        )
-        for tr, _ in _p2_splits
-    ]
-
-    fold_results = []
-    for alg in algorithms:
-        sampler = TPESampler(seed=random_state, multivariate=True)
-        study = create_study(
-            direction="maximize",
-            pruner=SuccessiveHalvingPruner(reduction_factor=2),
-            sampler=sampler,
-        )
-        # default-argument capture avoids the closure-over-loop-variable trap
-        study.optimize(
-            lambda trial, _alg=alg: objective(
-                trial,
-                X_train=X_train_sel,
-                y_train=y_train,
-                X_test=X_test_sel,
-                y_test=y_test,
-                sample_weight=w_train,
-                scoring=scoring,
-                task=task,
-                feature_selector=None,  # already applied in phase 1
-                scaler=scaler,
-                algorithm=_alg,  # fixed to this algorithm
-                hyperparameters="optimize",
-                random_state=random_state,
-                n_cv_jobs=_inner_jobs,
-                model_jobs=_model_jobs,
-                inner_cv_groups=groups_train,
-                inner_splits=_p2_splits,
-                inner_reduced_indices=_p2_reduced,
-            ),
-            n_trials=n_trials_per_alg,
-            n_jobs=1,
-        )
-
-        phase2_pipeline = instantiate_pipeline(
-            trial=study.best_trial,
-            feature_selector=None,
-            scaler=scaler,
-            algorithm=alg,
-            hyperparameters="optimize",
-            random_state=random_state,
-        )
-        final_pipeline = Pipeline(
-            fs_pipeline.steps
-            + [s for s in phase2_pipeline.steps if s[0] in ("scaler", "model")]
-        )
-
-        fold_results.append((f"fold_{fold_idx}_{alg}", final_pipeline, study))
-
-    return fold_results
-
-
 def train(
     X: Union[np.ndarray, pd.DataFrame],
     y: Union[np.ndarray, pd.Series, list],
@@ -710,58 +558,29 @@ def train(
     n_outer_folds = len(splits)
     n_cv_jobs = max(1, n_jobs // n_outer_folds)
 
-    per_alg_mode = isinstance(algorithm, list) and hyperparameters == "optimize"
-
-    if per_alg_mode:
-        n_trials_per_alg = max(1, n_trials // len(algorithm))
-        print(
-            f"[train] Per-algorithm HPO: {len(algorithm)} algorithm(s) × "
-            f"{n_trials_per_alg} trial(s) each."
+    # When `algorithm` is a list, Optuna handles it as a categorical search
+    # space inside the single per-fold study (see ``instantiate_pipeline``).
+    flat = Parallel(n_jobs=n_outer_folds)(
+        delayed(_train_fold)(
+            fold_idx=fold_idx,
+            X=X,
+            y=y,
+            sample_weight=sample_weight,
+            train_index=train_index,
+            test_index=test_index,
+            scoring=scoring,
+            task=task,
+            feature_selector=feature_selector,
+            scaler=scaler,
+            algorithm=algorithm,
+            hyperparameters=hyperparameters,
+            random_state=random_state,
+            n_trials=n_trials,
+            n_cv_jobs=n_cv_jobs,
+            inner_cv_groups=inner_cv_groups,
         )
-        raw = Parallel(n_jobs=n_outer_folds)(
-            delayed(_train_fold_multi_alg)(
-                fold_idx=fold_idx,
-                X=X,
-                y=y,
-                sample_weight=sample_weight,
-                train_index=train_index,
-                test_index=test_index,
-                scoring=scoring,
-                task=task,
-                feature_selector=feature_selector,
-                scaler=scaler,
-                algorithms=algorithm,
-                n_trials_per_alg=n_trials_per_alg,
-                n_cv_jobs=n_cv_jobs,
-                random_state=random_state,
-                inner_cv_groups=inner_cv_groups,
-            )
-            for fold_idx, (train_index, test_index) in enumerate(splits, start=1)
-        )
-        # raw is list-of-lists; flatten into (name, model, study) triples
-        flat = [entry for fold_list in raw for entry in fold_list]
-    else:
-        flat = Parallel(n_jobs=n_outer_folds)(
-            delayed(_train_fold)(
-                fold_idx=fold_idx,
-                X=X,
-                y=y,
-                sample_weight=sample_weight,
-                train_index=train_index,
-                test_index=test_index,
-                scoring=scoring,
-                task=task,
-                feature_selector=feature_selector,
-                scaler=scaler,
-                algorithm=algorithm,
-                hyperparameters=hyperparameters,
-                random_state=random_state,
-                n_trials=n_trials,
-                n_cv_jobs=n_cv_jobs,
-                inner_cv_groups=inner_cv_groups,
-            )
-            for fold_idx, (train_index, test_index) in enumerate(splits, start=1)
-        )
+        for fold_idx, (train_index, test_index) in enumerate(splits, start=1)
+    )
 
     models = {name: model for name, model, _ in flat}
     studies = {name: study for name, _, study in flat}
@@ -870,7 +689,6 @@ def nested_crossval(
     cfc_random_state: int = 2024,
     outer_cv_groups: Union[np.ndarray, pd.Series, list] = None,
     n_jobs: int = 16,
-    algorithms: Union[list, None] = None,
     max_svm_samples: int = 10_000,
     pos_weight_factor: float = 1.0,
 ):
@@ -892,15 +710,14 @@ def nested_crossval(
     X : pd.DataFrame
     y : pd.Series
     pipelines : dict
-        Mapping key → fitted Pipeline.  Single-algorithm mode: keys are
-        ``"fold_{i}"``; per-algorithm mode: ``"fold_{i}_{alg}"``.
+        Mapping ``"fold_{i}"`` → fitted Pipeline (one per outer fold).
     scoring : str or callable, default ``"MCC"``
         Metric used for early stopping during the reduction-pct sweep and
-        for picking the winning ``(fold, pct)`` per algorithm. Selection
-        runs on the **CFC** column (``"<metric> CFC"``); the TTS column is
-        reported alongside for diagnostic comparison. Should match the
-        metric the HPO optimised. Recognised string aliases: ``"MCC"``,
-        ``"PR AUC"``, ``"ROC AUC"``, ``"KS"``, plus common sklearn names
+        for picking each fold's best pct. Selection runs on the **CFC**
+        column (``"<metric> CFC"``); the TTS column is reported alongside
+        for diagnostic comparison. Should match the metric the HPO
+        optimised. Recognised string aliases: ``"MCC"``, ``"PR AUC"``,
+        ``"ROC AUC"``, ``"KS"``, plus common sklearn names
         (``"balanced_accuracy"``, ``"f1"``, ...).
     random_state : int, default 42
         Drives the TTS splits, which match train()'s outer CV grid.
@@ -913,12 +730,6 @@ def nested_crossval(
         Group labels for the outer StratifiedGroupKFold (used by both
         TTS and CFC grids).
     n_jobs : int, default 16
-    algorithms : list of str, optional
-        Per-algorithm mode: one best ``(fold, pct)`` is chosen per algorithm
-        and returned as an ordered list of refitted pipelines.  Validation has
-        a MultiIndex ``(algorithm, fold, reduction)``.
-        Single mode (``None``): one best ``(fold, pct)`` overall; validation
-        has a MultiIndex ``(fold, reduction)``.
 
     Returns
     -------
@@ -1178,29 +989,15 @@ def nested_crossval(
                     )
 
     # ------------------------------------------------------------------ #
-    # Build validation table (CFC + TTS metrics, MultiIndex as usual).   #
+    # Build validation table (CFC + TTS metrics, MultiIndex (fold, pct)).#
     # ------------------------------------------------------------------ #
-    if algorithms is not None:
-        index_tuples, rows = [], []
-        for alg in algorithms:
-            for (fold_key, pct), report in reports.items():
-                if fold_key.endswith(f"_{alg}"):
-                    index_tuples.append((alg, fold_key, pct))
-                    rows.append(report)
-        validation = pd.DataFrame(
-            rows,
-            index=pd.MultiIndex.from_tuples(
-                index_tuples, names=["algorithm", "fold", "reduction"]
-            ),
-        )
-    else:
-        index_tuples = list(reports.keys())
-        validation = pd.DataFrame(
-            list(reports.values()),
-            index=pd.MultiIndex.from_tuples(
-                index_tuples, names=["fold", "reduction"]
-            ),
-        )
+    index_tuples = list(reports.keys())
+    validation = pd.DataFrame(
+        list(reports.values()),
+        index=pd.MultiIndex.from_tuples(
+            index_tuples, names=["fold", "reduction"]
+        ),
+    )
 
     # ------------------------------------------------------------------ #
     # Per-fold selection: each fold_key picks its own best CFC pct,      #
@@ -1322,8 +1119,6 @@ def magic_now(
             header=True,
         )
 
-    per_alg_mode = isinstance(algorithm, list) and hyperparameters == "optimize"
-
     pipelines, studies = train(
         X=X,
         y=y,
@@ -1348,7 +1143,6 @@ def magic_now(
         scoring=scoring,
         outer_cv_groups=outer_cv_groups,
         n_jobs=n_jobs,
-        algorithms=algorithm if per_alg_mode else None,
         pos_weight_factor=pos_weight_factor,
         cfc_random_state=cfc_random_state,
     )
@@ -1506,45 +1300,18 @@ def magic_now(
     # Calibration variants stay refit-based per fold_key.                  #
     # ---------------------------------------------------------------------#
     if plots:
-        if per_alg_mode:
-            for alg in algorithm:
-                alg_cfc = {
-                    fk: oof["cfc"]
-                    for fk, oof in predictions_by_fold.items()
-                    if fk.endswith(f"_{alg}")
-                }
-                if not alg_cfc:
-                    continue
-                plot_pr_curve(
-                    alg_cfc,
-                    plots_dir / f"pr_curve_{alg}{tag}.pdf",
-                    title=f"PR curve — {alg}",
-                )
-                plot_roc_curve(
-                    alg_cfc,
-                    plots_dir / f"roc_curve_{alg}{tag}.pdf",
-                    title=f"ROC curve — {alg}",
-                )
-                plot_ks_statistic(
-                    alg_cfc,
-                    plots_dir / f"ks_statistic_{alg}{tag}.pdf",
-                    title=f"KS statistic — {alg}",
-                )
-        else:
-            cfc_only = {
-                fk: oof["cfc"] for fk, oof in predictions_by_fold.items()
-            }
-            plot_pr_curve(
-                cfc_only, plots_dir / f"pr_curve{tag}.pdf", title="PR curve"
-            )
-            plot_roc_curve(
-                cfc_only, plots_dir / f"roc_curve{tag}.pdf", title="ROC curve"
-            )
-            plot_ks_statistic(
-                cfc_only,
-                plots_dir / f"ks_statistic{tag}.pdf",
-                title="KS statistic",
-            )
+        cfc_only = {fk: oof["cfc"] for fk, oof in predictions_by_fold.items()}
+        plot_pr_curve(
+            cfc_only, plots_dir / f"pr_curve{tag}.pdf", title="PR curve"
+        )
+        plot_roc_curve(
+            cfc_only, plots_dir / f"roc_curve{tag}.pdf", title="ROC curve"
+        )
+        plot_ks_statistic(
+            cfc_only,
+            plots_dir / f"ks_statistic{tag}.pdf",
+            title="KS statistic",
+        )
 
         for fold_key, uncal_pipe in uncalibrated_pipeline.items():
             variants = compute_calibration_variants(
@@ -1571,36 +1338,28 @@ def magic_now(
     validation.to_csv(results_dir / f"validation{tag}.tsv", sep="\t", index=True)
 
     # ---------------------------------------------------------------------#
-    # Best hyperparameters per algorithm                                   #
+    # Best hyperparameters per outer fold                                  #
     # ---------------------------------------------------------------------#
+    best_params_rows = []
+    for fold_key, study in studies.items():
+        if not study.trials:
+            continue
+        row = {
+            "fold": fold_key,
+            "best_score": study.best_value,
+        }
+        # user_attrs override params so suggest_power values appear in
+        # their exponentiated form (e.g. learning_rate=0.01 not -2).
+        row.update(study.best_trial.params)
+        row.update(study.best_trial.user_attrs)
+        best_params_rows.append(row)
 
-    if per_alg_mode:
-        best_params_rows = []
-        for alg in algorithm:
-            alg_studies = {k: v for k, v in studies.items() if k.endswith(f"_{alg}")}
-            best_key = max(
-                alg_studies,
-                key=lambda k: (
-                    alg_studies[k].best_value if alg_studies[k].trials else -np.inf
-                ),
-            )
-            best_study = alg_studies[best_key]
-            row = {
-                "algorithm": alg,
-                "fold": best_key,
-                "best_score": best_study.best_value,
-            }
-            # user_attrs override params so suggest_power values appear in
-            # their exponentiated form (e.g. learning_rate=0.01 not -2).
-            row.update(best_study.best_trial.params)
-            row.update(best_study.best_trial.user_attrs)
-            best_params_rows.append(row)
-
-        best_params_df = pd.DataFrame(best_params_rows).set_index("algorithm")
+    if best_params_rows:
+        best_params_df = pd.DataFrame(best_params_rows).set_index("fold")
         best_params_df.to_csv(
             results_dir / f"best_params{tag}.tsv", sep="\t", index=True
         )
-        print("[magic_now] Best hyperparameters per algorithm:")
+        print("[magic_now] Best hyperparameters per fold:")
         print(best_params_df.to_string())
 
     return validation, model_payload, studies
