@@ -498,20 +498,40 @@ def _train_fold(
     # ------------------------------------------------------------------ #
     _all_percentages = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
     _min_inner_train = min(len(tr) for tr, _ in _p2_splits)
-    if _min_inner_train < 2000:
+    _MIN_TRAIN = 2000
+    _MAX_TRAIN = 10_000
+
+    if _min_inner_train < _MIN_TRAIN:
         _inner_pcts = [0.8, 0.9, 1.0]
     else:
-        _inner_pcts = [p for p in _all_percentages if int(p * _min_inner_train) >= 2000]
+        _inner_pcts = [
+            p for p in _all_percentages if int(p * _min_inner_train) >= _MIN_TRAIN
+        ]
+    # Universal max-train cap (applies to every algorithm, not just SVMs).
+    _inner_pcts = [p for p in _inner_pcts if int(p * _min_inner_train) <= _MAX_TRAIN]
+    if not _inner_pcts:
+        _inner_pcts = [round(_MAX_TRAIN / _min_inner_train, 4)]
+    _inner_pcts = sorted(_inner_pcts)
 
-    _last_step = final_pipeline.named_steps.get("model")
-    _is_svm = _last_step is not None and hasattr(_last_step, "kernel")
-    if _is_svm:
-        _inner_pcts = [p for p in _inner_pcts if int(p * _min_inner_train) <= 10_000]
-        if not _inner_pcts:
-            _inner_pcts = [round(10_000 / _min_inner_train, 4)]
+    # Early stopping criterion — same metric the HPO optimised.
+    _metric_col = scoring_to_metric_column(scoring, default="MCC")
+    _lower_better = metric_is_lower_better(_metric_col)
+    _is_better = (
+        (lambda new, cur: new <= cur)
+        if _lower_better
+        else (lambda new, cur: new >= cur)
+    )
+    _worst_init = float("inf") if _lower_better else float("-inf")
+    _cmp = ">" if _lower_better else "<"
+
+    _best_score = _worst_init
+    _flagged = False
+    _active = True
 
     inner_oof_per_pct = {}
     for _pct in _inner_pcts:
+        if not _active:
+            break
         _rows = []
         for _inner_train_idx, _inner_test_idx in _p2_splits:
             _X_tr_full = X_train.iloc[_inner_train_idx]
@@ -565,7 +585,36 @@ def _train_fold(
                     index=_y_te.index,
                 )
             )
-        inner_oof_per_pct[_pct] = pd.concat(_rows, axis=0)
+        _oof_df = pd.concat(_rows, axis=0)
+        inner_oof_per_pct[_pct] = _oof_df
+
+        # 2-strike early stop on the chosen scoring metric.
+        _rep = classification_report(
+            _oof_df["true"],
+            _oof_df["predicted"],
+            y_score=_oof_df["score"] if "score" in _oof_df.columns else None,
+        )
+        _score_val = _rep[_metric_col]
+        if not _flagged:
+            if _is_better(_score_val, _best_score):
+                _best_score = _score_val
+            else:
+                _flagged = True
+                print(
+                    f"[_train_fold {fold_idx}] dip at {int(_pct * 100)}% "
+                    f"({_metric_col}={_score_val:.4f} {_cmp} best={_best_score:.4f})"
+                    " — giving one more chance …"
+                )
+        else:
+            if _is_better(_score_val, _best_score):
+                _flagged = False
+                _best_score = _score_val
+            else:
+                _active = False
+                print(
+                    f"[_train_fold {fold_idx}] early stop at {int(_pct * 100)}% "
+                    f"({_metric_col}={_score_val:.4f} {_cmp} best={_best_score:.4f})"
+                )
 
     fold_name = f"fold_{fold_idx}"
     return fold_name, final_pipeline, study, inner_oof_per_pct
