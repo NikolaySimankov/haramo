@@ -17,7 +17,6 @@ from sklearn.model_selection import train_test_split
 
 import matplotlib.pyplot as plt
 
-
 ###########
 # Classes #
 ###########
@@ -116,6 +115,7 @@ def _fn_fp_loss_label(y_true, y_pred):
     """Lazy wrapper so :data:`_THRESHOLD_METRIC_FNS` can reference ``fn_fp_loss``
     without a top-level circular import from ``_evaluation``."""
     from ._evaluation import fn_fp_loss
+
     return fn_fp_loss(y_true, y_pred)
 
 
@@ -128,24 +128,37 @@ _THRESHOLD_METRIC_FNS = {
 }
 
 
-def find_best_threshold(y_true, y_score, metric="MCC", n_thresholds=101):
-    """Scan thresholds in ``[0, 1]``; return ``(best_threshold, best_value)``.
+def find_best_threshold(y_true, y_score, metric="FNFP Loss", n_thresholds=101):
+    """Scan thresholds in ``[0, 1]``; return ``(best_threshold, best_value, metric_used)``.
 
     ``metric`` is any identifier accepted by ``scoring_to_metric_column``.
     For higher-is-better metrics (MCC, F1, ...) the threshold maximising the
     metric is returned; for lower-is-better losses (FNFP Loss) the minimising
-    threshold is returned. Threshold-free metrics (PR AUC, ROC AUC, KS, Brier)
-    silently fall back to MCC.
+    threshold is returned. **Anything else** — threshold-free metrics (PR AUC,
+    ROC AUC, KS, Brier), callables, or unrecognised strings — falls back to
+    FNFP Loss with a printed note. The third return value is the name of the
+    metric actually used.
     """
     from ._evaluation import scoring_to_metric_column, metric_is_lower_better
 
-    metric_col = scoring_to_metric_column(metric, default="MCC")
-    if metric_col not in _THRESHOLD_METRIC_FNS:
+    _UNRECOGNISED = object()
+    resolved = scoring_to_metric_column(metric, default=_UNRECOGNISED)
+
+    if resolved is _UNRECOGNISED:
         print(
-            f"[threshold] {metric_col!r} is threshold-free; "
-            "falling back to MCC for threshold scan."
+            f"[threshold] scoring {metric!r} is not recognised for "
+            "threshold tuning; falling back to FNFP Loss."
         )
-        metric_col = "MCC"
+        metric_col = "FNFP Loss"
+    elif resolved not in _THRESHOLD_METRIC_FNS:
+        print(
+            f"[threshold] {resolved!r} is threshold-free; "
+            "falling back to FNFP Loss for threshold scan."
+        )
+        metric_col = "FNFP Loss"
+    else:
+        metric_col = resolved
+
     fn = _THRESHOLD_METRIC_FNS[metric_col]
     lower_better = metric_is_lower_better(metric_col)
 
@@ -154,7 +167,7 @@ def find_best_threshold(y_true, y_score, metric="MCC", n_thresholds=101):
     thresholds = np.linspace(0.0, 1.0, n_thresholds)
     scores = np.array([fn(y_true, (y_score >= t).astype(int)) for t in thresholds])
     best_idx = int(np.argmin(scores) if lower_better else np.argmax(scores))
-    return float(thresholds[best_idx]), float(scores[best_idx])
+    return float(thresholds[best_idx]), float(scores[best_idx]), metric_col
 
 
 def _proba_for_display(estimator, X):
@@ -172,9 +185,7 @@ def _proba_for_display(estimator, X):
         if denom <= 0:
             return np.full_like(df, 0.5, dtype=float)
         return np.clip((df - df.min()) / denom, 0.0, 1.0)
-    raise ValueError(
-        "Estimator has neither predict_proba nor decision_function"
-    )
+    raise ValueError("Estimator has neither predict_proba nor decision_function")
 
 
 def compute_calibration_variants(
@@ -239,8 +250,11 @@ def plot_calibration_curve(variants, output_path, title=None, n_bins=5):
         well-separated models into 3–4 quantile-clustered points.
     """
     fig, ax = plt.subplots(figsize=(6, 6))
-    colors = {"No calibration": "tab:red", "Isotonic": "tab:green",
-              "Sigmoid": "tab:blue"}
+    colors = {
+        "No calibration": "tab:red",
+        "Isotonic": "tab:green",
+        "Sigmoid": "tab:blue",
+    }
 
     for name, data in variants.items():
         y_true = np.asarray(data["y_true"]).astype(int)
@@ -255,18 +269,27 @@ def plot_calibration_curve(variants, output_path, title=None, n_bins=5):
         )
         brier = brier_score_loss(y_true, y_score)
         ax.plot(
-            prob_pred, prob_true, marker="o", lw=1.5,
+            prob_pred,
+            prob_true,
+            marker="o",
+            lw=1.5,
             color=colors.get(name),
             label=f"{name} ({brier:.3f})",
         )
 
     ax.plot(
-        [0, 1], [0, 1], linestyle="--", color="gray", alpha=0.5,
+        [0, 1],
+        [0, 1],
+        linestyle="--",
+        color="gray",
+        alpha=0.5,
         label="Perfectly calibrated",
     )
     ax.set(
-        xlabel="Mean predicted probability", ylabel="Fraction of positives",
-        xlim=(-0.01, 1.01), ylim=(-0.01, 1.01),
+        xlabel="Mean predicted probability",
+        ylabel="Fraction of positives",
+        xlim=(-0.01, 1.01),
+        ylim=(-0.01, 1.01),
         title=title or "Calibration plots (Brier in legend)",
     )
     ax.legend(loc="lower right", fontsize=8)

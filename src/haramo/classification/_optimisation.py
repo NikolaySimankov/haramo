@@ -1188,7 +1188,6 @@ def magic_now(
     plots: bool = True,
     calibration: Union[str, None] = None,
     optimize_threshold: bool = False,
-    threshold_metric: str = "MCC",
 ):
 
     if not output_dir:
@@ -1354,17 +1353,17 @@ def magic_now(
                     y_true_arr = oof_df["true"].to_numpy()
                     y_score_arr = oof_df["score"].to_numpy()
 
-                threshold, threshold_score = find_best_threshold(
+                threshold, threshold_score, used_metric = find_best_threshold(
                     y_true_arr,
                     y_score_arr,
-                    metric=threshold_metric,
+                    metric=scoring,
                 )
 
                 pipe = ThresholdedClassifier(pipe, threshold=threshold)
 
                 print(
                     f"[magic_now] {label}: threshold={threshold:.3f} "
-                    f"({threshold_metric}={threshold_score:.4f})."
+                    f"({used_metric}={threshold_score:.4f})."
                 )
 
             return pipe
