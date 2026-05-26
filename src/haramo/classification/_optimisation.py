@@ -41,9 +41,13 @@ from ..utils import (
     scoring_to_metric_column,
     metric_is_lower_better,
     plot_pr_curve,
+    plot_pr_curve_grouped,
     plot_roc_curve,
+    plot_roc_curve_grouped,
     plot_ks_statistic,
+    plot_ks_statistic_grouped,
     plot_calibration_curve,
+    plot_calibration_curve_grouped,
     fit_score_calibrator,
     pick_best_score_calibration_method,
     find_best_threshold,
@@ -95,7 +99,7 @@ def _score_fold(
         reduced_index = reduce_dataset(
             X=X_train,
             y=y_train,
-            target_size=10000,
+            target_size=2000,
             stage2_shrink=1,
             class_weight="balanced",
             random_state=random_state,
@@ -435,7 +439,7 @@ def _train_fold(
         reduce_dataset(
             X=X_train_sel.iloc[tr],
             y=y_train.iloc[tr],
-            target_size=10000,
+            target_size=2000,
             stage2_shrink=1,
             class_weight="balanced",
             random_state=random_state,
@@ -1151,6 +1155,11 @@ def magic_now(
     # are then applied to CFC + TTS scores for honest evaluation, and to   #
     # the inner OOF itself for the threshold scan.                          #
     # ---------------------------------------------------------------------#
+    # Map each fold_key to its chosen reduction pct (taken from the
+    # nested_crossval `validation` table's MultiIndex). Used to surface
+    # the reduction column in the per-variant evaluation table.
+    best_pct_per_fold = {fk: pct for fk, pct in validation.index}
+
     evaluation_rows: list = []
     evaluation_index: list = []
     calibrated_artifacts: dict = {}
@@ -1226,42 +1235,58 @@ def magic_now(
             cfc_pred_cal_thr = (cfc_score_cal >= calibrated_threshold).astype(int)
             tts_pred_cal_thr = (tts_score_cal >= calibrated_threshold).astype(int)
 
+            # Each variant carries its own (method, threshold) — raw model
+            # has neither calibrator nor tuned threshold; calibrated@0.5 has
+            # the calibrator but the default cutoff; calibrated+threshold
+            # has both.
             variant_specs = [
-                (
-                    "raw model",
-                    cfc_pred_raw,
-                    cfc_score_raw,
-                    tts_pred_raw,
-                    tts_score_raw,
-                ),
-                (
-                    "calibrated model",
-                    cfc_pred_cal_05,
-                    cfc_score_cal,
-                    tts_pred_cal_05,
-                    tts_score_cal,
-                ),
+                {
+                    "label": "raw model",
+                    "cfc_pred": cfc_pred_raw,
+                    "cfc_score": cfc_score_raw,
+                    "tts_pred": tts_pred_raw,
+                    "tts_score": tts_score_raw,
+                    "method": None,
+                    "threshold": 0.5,
+                },
+                {
+                    "label": "calibrated model",
+                    "cfc_pred": cfc_pred_cal_05,
+                    "cfc_score": cfc_score_cal,
+                    "tts_pred": tts_pred_cal_05,
+                    "tts_score": tts_score_cal,
+                    "method": calibrated_method,
+                    "threshold": 0.5,
+                },
             ]
             if optimize_threshold:
                 variant_specs.append(
-                    (
-                        "calibrated model with threshold",
-                        cfc_pred_cal_thr,
-                        cfc_score_cal,
-                        tts_pred_cal_thr,
-                        tts_score_cal,
-                    )
+                    {
+                        "label": "calibrated model with threshold",
+                        "cfc_pred": cfc_pred_cal_thr,
+                        "cfc_score": cfc_score_cal,
+                        "tts_pred": tts_pred_cal_thr,
+                        "tts_score": tts_score_cal,
+                        "method": calibrated_method,
+                        "threshold": calibrated_threshold,
+                    }
                 )
 
-            for label, c_pred, c_score, t_pred, t_score in variant_specs:
-                cfc_report = classification_report(cfc_true, c_pred, y_score=c_score)
-                tts_report = classification_report(tts_true, t_pred, y_score=t_score)
+            fold_best_pct = best_pct_per_fold[fold_key]
+            for v in variant_specs:
+                cfc_report = classification_report(
+                    cfc_true, v["cfc_pred"], y_score=v["cfc_score"]
+                )
+                tts_report = classification_report(
+                    tts_true, v["tts_pred"], y_score=v["tts_score"]
+                )
                 combined = pd.concat(
                     [cfc_report.add_suffix(" CFC"), tts_report.add_suffix(" TTS")]
                 )
-                combined["label"] = label
-                combined["calibration_method"] = calibrated_method
-                combined["threshold"] = calibrated_threshold
+                combined["label"] = v["label"]
+                combined["reduction"] = fold_best_pct
+                combined["calibration_method"] = v["method"]
+                combined["threshold"] = v["threshold"]
                 evaluation_rows.append(combined)
                 evaluation_index.append(fold_key)
 
@@ -1275,9 +1300,13 @@ def magic_now(
         validation.index.name = "fold"
     else:
         # nested_crossval already produced the raw CFC+TTS validation table
-        # for each fold's best pct; just label the rows.
-        validation = validation.copy()
+        # for each fold's best pct; lift the reduction from the MultiIndex
+        # into a column and label the rows so the schema matches the
+        # calibration-on branch.
+        validation = validation.copy().reset_index(level="reduction")
         validation["label"] = "raw model"
+        validation["calibration_method"] = None
+        validation["threshold"] = 0.5
 
     # ---------------------------------------------------------------------#
     # Persist artefacts. Single pickle keyed by fold_key; values are       #
@@ -1295,17 +1324,82 @@ def magic_now(
         pickle.dump(studies, handle)
 
     # ---------------------------------------------------------------------#
-    # Plots: CFC OOF feeds PR / ROC / KS (more samples per curve).         #
-    # Calibration variants stay refit-based per fold_key.                  #
+    # Plots: PR / ROC / KS shown for both grids (CFC vs TTS) and both      #
+    # variants (Raw vs Calibrated) on the same axes. Color = grid,        #
+    # linestyle = variant.                                                 #
     # ---------------------------------------------------------------------#
     if plots:
-        cfc_only = {fk: oof["cfc"] for fk, oof in predictions_by_fold.items()}
-        plot_pr_curve(cfc_only, plots_dir / f"pr_curve{tag}.pdf", title="PR curve")
-        plot_roc_curve(cfc_only, plots_dir / f"roc_curve{tag}.pdf", title="ROC curve")
-        plot_ks_statistic(
-            cfc_only,
+        raw_cfc = {fk: oof["cfc"] for fk, oof in predictions_by_fold.items()}
+        raw_tts = {fk: oof["tts"] for fk, oof in predictions_by_fold.items()}
+
+        cal_cfc: dict = {}
+        cal_tts: dict = {}
+        for fk, art in calibrated_artifacts.items():
+            if art.calibrator is None:
+                continue
+            cfc_df = predictions_by_fold[fk]["cfc"].copy()
+            tts_df = predictions_by_fold[fk]["tts"].copy()
+            cfc_df["score"] = art.calibrator.predict(
+                cfc_df["score"].to_numpy(dtype=float)
+            )
+            tts_df["score"] = art.calibrator.predict(
+                tts_df["score"].to_numpy(dtype=float)
+            )
+            cal_cfc[fk] = cfc_df
+            cal_tts[fk] = tts_df
+
+        plot_groups = [
+            {
+                "label": "Raw CFC",
+                "color": "tab:blue",
+                "linestyle": "-",
+                "preds": raw_cfc,
+            },
+            {
+                "label": "Raw TTS",
+                "color": "tab:orange",
+                "linestyle": "-",
+                "preds": raw_tts,
+            },
+        ]
+        if cal_cfc:
+            plot_groups.append(
+                {
+                    "label": "Calibrated CFC",
+                    "color": "tab:blue",
+                    "linestyle": "--",
+                    "preds": cal_cfc,
+                },
+            )
+        if cal_tts:
+            plot_groups.append(
+                {
+                    "label": "Calibrated TTS",
+                    "color": "tab:orange",
+                    "linestyle": "--",
+                    "preds": cal_tts,
+                },
+            )
+
+        plot_pr_curve_grouped(
+            plot_groups,
+            plots_dir / f"pr_curve{tag}.pdf",
+            title="PR — Raw vs Calibrated, CFC vs TTS",
+        )
+        plot_roc_curve_grouped(
+            plot_groups,
+            plots_dir / f"roc_curve{tag}.pdf",
+            title="ROC — Raw vs Calibrated, CFC vs TTS",
+        )
+        plot_ks_statistic_grouped(
+            plot_groups,
             plots_dir / f"ks_statistic{tag}.pdf",
-            title="KS statistic",
+            title="KS gap — Raw vs Calibrated, CFC vs TTS",
+        )
+        plot_calibration_curve_grouped(
+            plot_groups,
+            plots_dir / f"reliability{tag}.pdf",
+            title="Reliability — Raw vs Calibrated, CFC vs TTS",
         )
 
         for fold_key, uncal_pipe in uncalibrated_pipeline.items():

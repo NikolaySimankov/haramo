@@ -128,7 +128,7 @@ def _fs_objective(
                 reduced_index = reduce_dataset(
                     X=X_tr,
                     y=y_tr,
-                    target_size=10000,
+                    target_size=2000,
                     stage2_shrink=1,
                     class_weight="balanced",
                     random_state=random_state,
@@ -214,7 +214,7 @@ def select_best_feature_selector(
         reduce_dataset(
             X=X_train.iloc[tr],
             y=y_train.iloc[tr],
-            target_size=10000,
+            target_size=2000,
             stage2_shrink=1,
             class_weight="balanced",
             random_state=random_state,

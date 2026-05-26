@@ -615,6 +615,250 @@ def plot_ks_statistic(predictions_by_model, output_path, title=None, n_deciles=1
     plt.close(fig)
 
 
+def _iter_groups(groups):
+    """Yield ``(label, color, linestyle, preds)`` from a list of group specs."""
+    for spec in groups:
+        preds = spec.get("preds") or {}
+        if not preds:
+            continue
+        yield (
+            spec["label"],
+            spec.get("color", "b"),
+            spec.get("linestyle", "-"),
+            preds,
+        )
+
+
+def plot_pr_curve_grouped(groups, output_path, title=None, mark_cutoff=0.5):
+    """Multi-group PR plot — one mean curve + std band per group.
+
+    Parameters
+    ----------
+    groups : list of dict
+        Each entry: ``{"label": str, "color": str, "linestyle": str,
+        "preds": {fold_key: DataFrame[true, predicted, score]}}``. Within
+        each group, per-fold AP values produce a mean ± std band; across
+        groups, color/linestyle distinguish (e.g. CFC vs TTS, Raw vs Cal).
+    output_path : path-like
+    title : str, optional
+    mark_cutoff : float, default 0.5
+        Marker for the average ``(recall, precision)`` at this threshold
+        per group. Pass ``None`` to skip.
+    """
+    fig, ax = plt.subplots(figsize=(7, 7))
+    recall_grid = np.linspace(0, 1, 100)
+
+    for label, color, ls, preds in _iter_groups(groups):
+        per_fold, aps = [], []
+        for df in preds.values():
+            y_true = df["true"].to_numpy().astype(int)
+            y_score = df["score"].to_numpy(dtype=float)
+            if y_score.size == 0:
+                continue
+            precision, recall, _ = precision_recall_curve(y_true, y_score)
+            aps.append(average_precision_score(y_true, y_score))
+            per_fold.append((recall[::-1], precision[::-1]))
+        if not per_fold:
+            continue
+        mean_p, std_p = _aggregate_curves(per_fold, recall_grid)
+        ax.plot(
+            recall_grid, mean_p,
+            color=color, linestyle=ls, lw=2,
+            label=fr"{label} (AP = {np.mean(aps):.2f} $\pm$ {np.std(aps):.2f})",
+        )
+        ax.fill_between(
+            recall_grid,
+            np.clip(mean_p - std_p, 0, 1),
+            np.clip(mean_p + std_p, 0, 1),
+            color=color, alpha=0.12,
+        )
+        if mark_cutoff is not None:
+            rs, ps = [], []
+            for df in preds.values():
+                y_true = df["true"].to_numpy().astype(int)
+                y_score = df["score"].to_numpy(dtype=float)
+                y_pred = (y_score >= mark_cutoff).astype(int)
+                rs.append(recall_score(y_true, y_pred, zero_division=0))
+                ps.append(precision_score(y_true, y_pred, zero_division=0))
+            ax.plot(
+                np.mean(rs), np.mean(ps),
+                marker="o", markersize=7, color=color, linestyle="None",
+            )
+
+    ax.set(
+        xlabel="Recall", ylabel="Precision",
+        xlim=(-0.01, 1.01), ylim=(-0.01, 1.01),
+        title=title or "Precision-Recall (mean across folds)",
+    )
+    ax.legend(loc="lower left", fontsize=8)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(output_path)
+    plt.close(fig)
+
+
+def plot_roc_curve_grouped(groups, output_path, title=None):
+    """Multi-group ROC plot — one mean curve + std band per group.
+
+    See :func:`plot_pr_curve_grouped` for ``groups`` spec.
+    """
+    fig, ax = plt.subplots(figsize=(7, 7))
+    fpr_grid = np.linspace(0, 1, 100)
+
+    for label, color, ls, preds in _iter_groups(groups):
+        per_fold, aucs = [], []
+        for df in preds.values():
+            y_true = df["true"].to_numpy().astype(int)
+            y_score = df["score"].to_numpy(dtype=float)
+            if y_score.size == 0:
+                continue
+            fpr, tpr, _ = roc_curve(y_true, y_score)
+            aucs.append(auc(fpr, tpr))
+            per_fold.append((fpr, tpr))
+        if not per_fold:
+            continue
+        mean_tpr, std_tpr = _aggregate_curves(per_fold, fpr_grid)
+        mean_tpr[0], mean_tpr[-1] = 0.0, 1.0
+        ax.plot(
+            fpr_grid, mean_tpr,
+            color=color, linestyle=ls, lw=2,
+            label=fr"{label} (AUC = {np.mean(aucs):.2f} $\pm$ {np.std(aucs):.2f})",
+        )
+        ax.fill_between(
+            fpr_grid,
+            np.clip(mean_tpr - std_tpr, 0, 1),
+            np.clip(mean_tpr + std_tpr, 0, 1),
+            color=color, alpha=0.12,
+        )
+
+    ax.plot(
+        [0, 1], [0, 1], linestyle=":", color="gray", alpha=0.6, label="Chance",
+    )
+    ax.set(
+        xlabel="False Positive Rate", ylabel="True Positive Rate",
+        xlim=(-0.01, 1.01), ylim=(-0.01, 1.01),
+        title=title or "ROC (mean across folds)",
+    )
+    ax.legend(loc="lower right", fontsize=8)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(output_path)
+    plt.close(fig)
+
+
+def plot_calibration_curve_grouped(
+    groups, output_path, title=None, n_bins=10, strategy="uniform"
+):
+    """Multi-group reliability plot — one curve per group, pooled across folds.
+
+    Parameters
+    ----------
+    groups : list of dict
+        Each entry: ``{"label": str, "color": str, "linestyle": str,
+        "preds": {fold_key: DataFrame[true, predicted, score]}}``. Within
+        each group, ``(true, score)`` pairs are concatenated across folds
+        and one reliability curve + Brier value are computed on the pooled
+        data.
+    output_path : path-like
+    title : str, optional
+    n_bins : int, default 10
+    strategy : {"uniform", "quantile"}, default "uniform"
+        Forwarded to ``sklearn.calibration.calibration_curve``.
+    """
+    fig, ax = plt.subplots(figsize=(7, 7))
+
+    for label, color, ls, preds in _iter_groups(groups):
+        y_true_pool = []
+        y_score_pool = []
+        for df in preds.values():
+            y_true_pool.append(df["true"].to_numpy().astype(int))
+            y_score_pool.append(df["score"].to_numpy(dtype=float))
+        if not y_score_pool:
+            continue
+        y_true = np.concatenate(y_true_pool)
+        y_score = np.clip(np.concatenate(y_score_pool), 0.0, 1.0)
+        if y_score.size == 0:
+            continue
+        prob_true, prob_pred = calibration_curve(
+            y_true, y_score, n_bins=n_bins, strategy=strategy
+        )
+        brier = brier_score_loss(y_true, y_score)
+        ax.plot(
+            prob_pred, prob_true,
+            marker="o", lw=1.8,
+            color=color, linestyle=ls,
+            label=f"{label} (Brier={brier:.3f})",
+        )
+
+    ax.plot(
+        [0, 1], [0, 1],
+        linestyle=":", color="gray", alpha=0.6,
+        label="Perfectly calibrated",
+    )
+    ax.set(
+        xlabel="Mean predicted probability",
+        ylabel="Fraction of positives",
+        xlim=(-0.01, 1.01), ylim=(-0.01, 1.01),
+        title=title or "Reliability (pooled across folds, Brier in legend)",
+    )
+    ax.legend(loc="lower right", fontsize=8)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(output_path)
+    plt.close(fig)
+
+
+def plot_ks_statistic_grouped(groups, output_path, title=None, n_deciles=10):
+    """Multi-group KS plot — one **gap curve** per group.
+
+    For each group, computes the per-decile gap ``|cum_pos - cum_neg|`` as
+    the mean across folds, draws one curve per group, and annotates the
+    KS statistic (max gap) per group in the legend.
+    """
+    fig, ax = plt.subplots(figsize=(7, 7))
+    deciles = np.arange(0, n_deciles + 1)
+
+    for label, color, ls, preds in _iter_groups(groups):
+        per_fold_gap, ks_maxes = [], []
+        for df in preds.values():
+            y_true = df["true"].to_numpy().astype(int)
+            y_score = df["score"].to_numpy(dtype=float)
+            if y_score.size == 0:
+                continue
+            dt = decile_table_ks(y_true, y_score, n_deciles=n_deciles)
+            cum_pos = np.append(0.0, dt["cum_positive_rate"].values)
+            cum_neg = np.append(0.0, dt["cum_negative_rate"].values)
+            per_fold_gap.append(np.abs(cum_pos - cum_neg))
+            ks_maxes.append(float(dt["KS"].max()))
+        if not per_fold_gap:
+            continue
+        gap = np.asarray(per_fold_gap)
+        mean_gap = gap.mean(axis=0)
+        std_gap = gap.std(axis=0)
+        ax.plot(
+            deciles, mean_gap, marker="o",
+            color=color, linestyle=ls, lw=2,
+            label=fr"{label} (KS = {np.mean(ks_maxes):.3f} $\pm$ {np.std(ks_maxes):.3f})",
+        )
+        ax.fill_between(
+            deciles,
+            np.clip(mean_gap - std_gap, 0, 1),
+            np.clip(mean_gap + std_gap, 0, 1),
+            color=color, alpha=0.12,
+        )
+
+    ax.set(
+        xlabel="Decile", ylabel=r"$|\,$cum. positives $-$ cum. negatives$\,|$",
+        xlim=(0, n_deciles), ylim=(0, 1),
+        title=title or "KS gap (mean across folds)",
+    )
+    ax.legend(loc="lower right", fontsize=8)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(output_path)
+    plt.close(fig)
+
+
 def plot_roc_curve(predictions_by_model, output_path, title=None):
     """Plot one ROC curve per competing outer-fold model + mean +/- std band.
 

@@ -36,7 +36,7 @@ if __name__ == "__main__":
 
     path = Path(".")
 
-    output_dir = path / "local_test"
+    output_dir = path / "local_test2"
     output_dir.mkdir(exist_ok=True)
 
     data = Path("C:\\Users\\nikol\\Documents\\GitHub\\PhytovirusDB\\data")

@@ -89,7 +89,7 @@ def _score_dataset_combo(
         reduced_index = reduce_dataset(
             X=X_train,
             y=y_train,
-            target_size=10000,
+            target_size=2000,
             stage2_shrink=1,
             class_weight="balanced",
             random_state=random_state,
