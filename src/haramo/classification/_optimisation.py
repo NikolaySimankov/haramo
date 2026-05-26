@@ -57,6 +57,24 @@ from ..feature_selection import select_best_dataset_combo, select_best_feature_s
 #############
 
 
+def _balanced_sample_weight(y, pos_weight_factor: float = 1.0) -> pd.Series:
+    """Compute sklearn's "balanced" sample weights, then scale the positive
+    class by ``pos_weight_factor``.
+
+    With ``pos_weight_factor=1.0`` the result is identical to
+    ``compute_sample_weight(class_weight="balanced", y=y)``. Higher values
+    push the model to weight false negatives more heavily; lower values
+    relax the balanced correction toward the natural class prior.
+    """
+    sw = pd.Series(
+        compute_sample_weight(class_weight="balanced", y=y), index=y.index
+    )
+    if pos_weight_factor != 1.0:
+        pos_mask = y == 1
+        sw.loc[pos_mask] = sw.loc[pos_mask] * float(pos_weight_factor)
+    return sw
+
+
 def _score_fold(
     pipeline,
     X,
@@ -639,6 +657,7 @@ def train(
     outer_cv_groups: Union[np.ndarray, pd.Series, list] = None,
     inner_cv_groups: Union[np.ndarray, pd.Series, list] = None,
     n_jobs: int = 16,
+    pos_weight_factor: float = 1.0,
 ):
     """
     Train a model using stratified k-fold cross-validation and hyperparameter optimization.
@@ -676,10 +695,7 @@ def train(
         A dictionary containing trained models for each fold.
     """
 
-    sample_weight = pd.Series(
-        compute_sample_weight(class_weight="balanced", y=y),
-        index=y.index,
-    )
+    sample_weight = _balanced_sample_weight(y, pos_weight_factor=pos_weight_factor)
 
     if outer_cv_groups is not None:
         strat_kfold_outer = StratifiedGroupKFold(n_splits=4)
@@ -855,6 +871,7 @@ def nested_crossval(
     n_jobs: int = 16,
     algorithms: Union[list, None] = None,
     max_svm_samples: int = 10_000,
+    pos_weight_factor: float = 1.0,
 ):
     """
     Perform nested cross-validation jointly optimising over trained model
@@ -907,10 +924,7 @@ def nested_crossval(
         mode, an ordered list aligned with ``algorithms``. Suitable input
         for ``plot_pr_curve`` / ``plot_roc_curve``.
     """
-    sample_weight = pd.Series(
-        compute_sample_weight(class_weight="balanced", y=y),
-        index=y.index,
-    )
+    sample_weight = _balanced_sample_weight(y, pos_weight_factor=pos_weight_factor)
 
     # The early-stopping criterion and the final (fold, pct) ranking use
     # the same metric the HPO optimised. Falls back to MCC for callable
@@ -1188,6 +1202,7 @@ def magic_now(
     plots: bool = True,
     calibration: Union[str, None] = None,
     optimize_threshold: bool = False,
+    pos_weight_factor: float = 1.0,
 ):
 
     if not output_dir:
@@ -1261,6 +1276,7 @@ def magic_now(
         outer_cv_groups=outer_cv_groups,
         inner_cv_groups=inner_cv_groups,
         n_jobs=n_jobs,
+        pos_weight_factor=pos_weight_factor,
     )
 
     validation, pipeline, predictions = nested_crossval(
@@ -1271,6 +1287,7 @@ def magic_now(
         outer_cv_groups=outer_cv_groups,
         n_jobs=n_jobs,
         algorithms=algorithm if per_alg_mode else None,
+        pos_weight_factor=pos_weight_factor,
     )
 
     # Keep a reference to the uncalibrated pipeline(s) for the calibration
@@ -1280,10 +1297,7 @@ def magic_now(
 
     # Computed once and reused by both the calibration block (if enabled)
     # and the calibration variants plot.
-    sample_weight = pd.Series(
-        compute_sample_weight(class_weight="balanced", y=y),
-        index=y.index,
-    )
+    sample_weight = _balanced_sample_weight(y, pos_weight_factor=pos_weight_factor)
 
     # ---------------------------------------------------------------------#
     # Optional calibration + threshold tuning on the winning pipeline(s).  #
