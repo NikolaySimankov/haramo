@@ -487,8 +487,86 @@ def _train_fold(
         + [s for s in phase2_pipeline.steps if s[0] in ("scaler", "model")]
     )
 
+    # ------------------------------------------------------------------ #
+    # Inner-OOF pct sweep — drives all downstream supervised selection   #
+    # (best_pct, calibration method, calibrator fit, threshold) without  #
+    # ever touching this fold's outer-test rows. Reuses `_p2_splits`     #
+    # (3-fold CV inside this outer fold's training data) so the inner    #
+    # CV grid matches HPO's.                                              #
+    # ------------------------------------------------------------------ #
+    _all_percentages = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+    _min_inner_train = min(len(tr) for tr, _ in _p2_splits)
+    if _min_inner_train < 2000:
+        _inner_pcts = [0.8, 0.9, 1.0]
+    else:
+        _inner_pcts = [p for p in _all_percentages if int(p * _min_inner_train) >= 2000]
+
+    _last_step = final_pipeline.named_steps.get("model")
+    _is_svm = _last_step is not None and hasattr(_last_step, "kernel")
+    if _is_svm:
+        _inner_pcts = [p for p in _inner_pcts if int(p * _min_inner_train) <= 10_000]
+        if not _inner_pcts:
+            _inner_pcts = [round(10_000 / _min_inner_train, 4)]
+
+    inner_oof_per_pct = {}
+    for _pct in _inner_pcts:
+        _rows = []
+        for _inner_train_idx, _inner_test_idx in _p2_splits:
+            _X_tr_full = X_train.iloc[_inner_train_idx]
+            _y_tr_full = y_train.iloc[_inner_train_idx]
+            _w_tr_full = w_train.iloc[_inner_train_idx]
+            _X_te = X_train.iloc[_inner_test_idx]
+            _y_te = y_train.iloc[_inner_test_idx]
+
+            if _pct < 1.0:
+                _red_idx = reduce_dataset(
+                    X=_X_tr_full,
+                    y=_y_tr_full,
+                    target_size=int(_pct * len(_inner_train_idx)),
+                    stage2_shrink=1,
+                    class_weight="balanced",
+                    random_state=random_state,
+                    verbose=False,
+                )
+                _X_tr = _X_tr_full.loc[_red_idx]
+                _y_tr = _y_tr_full.loc[_red_idx]
+                _w_tr = _w_tr_full.loc[_red_idx]
+            else:
+                _X_tr, _y_tr, _w_tr = _X_tr_full, _y_tr_full, _w_tr_full
+
+            _pipe = clone(final_pipeline)
+            try:
+                _pipe.fit(_X_tr, _y_tr, model__sample_weight=_w_tr)
+            except Exception:
+                _pipe.fit(_X_tr, _y_tr)
+
+            _predicted = _pipe.predict(_X_te)
+            if hasattr(_pipe, "predict_proba"):
+                _proba = _pipe.predict_proba(_X_te)
+                _score = (
+                    _proba[:, 1]
+                    if _proba.ndim == 2 and _proba.shape[1] >= 2
+                    else _proba.ravel()
+                )
+            elif hasattr(_pipe, "decision_function"):
+                _score = _pipe.decision_function(_X_te)
+            else:
+                _score = np.full(len(_y_te), np.nan)
+
+            _rows.append(
+                pd.DataFrame(
+                    {
+                        "true": np.asarray(_y_te),
+                        "predicted": _predicted,
+                        "score": _score,
+                    },
+                    index=_y_te.index,
+                )
+            )
+        inner_oof_per_pct[_pct] = pd.concat(_rows, axis=0)
+
     fold_name = f"fold_{fold_idx}"
-    return fold_name, final_pipeline, study
+    return fold_name, final_pipeline, study, inner_oof_per_pct
 
 
 def train(
@@ -539,8 +617,15 @@ def train(
 
     Returns:
     --------
-    models : dict
-        A dictionary containing trained models for each fold.
+    models : dict[str, Pipeline]
+        One unfitted final pipeline per outer fold, keyed by ``"fold_{i}"``.
+    studies : dict[str, optuna.Study]
+        Phase-2 Optuna study per outer fold.
+    inner_oof : dict[str, dict[float, pd.DataFrame]]
+        Per outer fold: ``{pct: DataFrame[true, predicted, score]}`` indexed by
+        outer-train row indices. Produced by an inner-CV pct sweep on the
+        winning pipeline and used by ``nested_crossval`` / ``magic_now`` as the
+        honest selection-OOF set (never touches the outer-test rows).
     """
 
     sample_weight = _balanced_sample_weight(y, pos_weight_factor=pos_weight_factor)
@@ -582,10 +667,11 @@ def train(
         for fold_idx, (train_index, test_index) in enumerate(splits, start=1)
     )
 
-    models = {name: model for name, model, _ in flat}
-    studies = {name: study for name, _, study in flat}
+    models = {name: model for name, model, _, _ in flat}
+    studies = {name: study for name, _, study, _ in flat}
+    inner_oof = {name: oof for name, _, _, oof in flat}
 
-    return models, studies
+    return models, studies, inner_oof
 
 
 def _fit_and_predict(
@@ -684,6 +770,7 @@ def nested_crossval(
     X: Union[np.ndarray, pd.DataFrame],
     y: Union[np.ndarray, pd.Series, list],
     pipelines: dict,
+    inner_oof: dict,
     scoring: Union[str, Callable] = "MCC",
     random_state: int = 42,
     cfc_random_state: int = 2024,
@@ -711,21 +798,20 @@ def nested_crossval(
     y : pd.Series
     pipelines : dict
         Mapping ``"fold_{i}"`` → fitted Pipeline (one per outer fold).
+    inner_oof : dict[str, dict[float, pd.DataFrame]]
+        Inner-OOF predictions from ``train()`` — ``{fold_key: {pct: df}}``,
+        each df indexed by outer-train rows with columns
+        ``["true", "predicted", "score"]``. Drives best_pct selection and
+        is forwarded to ``magic_now`` for calibrator/threshold fitting,
+        keeping every supervised choice clean of the outer-test fold.
     scoring : str or callable, default ``"MCC"``
-        Metric used for early stopping during the reduction-pct sweep and
-        for picking each fold's best pct. Selection runs on the **CFC**
-        column (``"<metric> CFC"``); the TTS column is reported alongside
-        for diagnostic comparison. Should match the metric the HPO
-        optimised. Recognised string aliases: ``"MCC"``, ``"PR AUC"``,
-        ``"ROC AUC"``, ``"KS"``, plus common sklearn names
-        (``"balanced_accuracy"``, ``"f1"``, ...).
+        Metric used to pick each fold's best reduction pct from the inner
+        OOF. CFC + TTS metrics are reported in the validation table but
+        never drive selection.
     random_state : int, default 42
         Drives the TTS splits, which match train()'s outer CV grid.
     cfc_random_state : int, default 2024
-        Independent fixed seed for the CFC evaluation grid. Differs from
-        ``random_state`` so the cross-fold competition is computed on a
-        shared, neutral grid (not the same one each fold_key was trained
-        against).
+        Independent fixed seed for the CFC evaluation grid.
     outer_cv_groups : array-like, optional
         Group labels for the outer StratifiedGroupKFold (used by both
         TTS and CFC grids).
@@ -734,39 +820,28 @@ def nested_crossval(
     Returns
     -------
     validation : pd.DataFrame
-        Classification report with MultiIndex as described above. Every
-        metric column appears twice, suffixed ``" CFC"`` (cross-fold
-        competition, concatenated across the cfc_splits grid) and
-        ``" TTS"`` (true test set, the fold_key's original held-out
-        outer-fold split).
+        Per-fold classification report at each fold's chosen ``best_pct``.
+        MultiIndex (fold, reduction); every metric column appears with both
+        ``" CFC"`` and ``" TTS"`` suffixes.
     best_pipelines : dict[str, Pipeline]
-        One refitted pipeline per fold_key, each at its own best CFC pct.
-        Keys are ``"fold_{i}"`` in single mode, ``"fold_{i}_{alg}"`` in
-        per-algorithm mode.
+        One refitted pipeline per fold_key, at its own best pct, fit on
+        full ``X``.
     best_predictions : dict[str, dict[str, pd.DataFrame]]
-        ``{fold_key: {"cfc": cfc_oof_df, "tts": tts_oof_df}}``. CFC is the
-        concatenation across cfc_splits at the fold's best pct; TTS is the
-        single OOF DataFrame from the fold_key's original outer-fold split.
-        Both DataFrames have columns ``["true", "predicted", "score"]``.
+        ``{fold_key: {"inner": ..., "cfc": ..., "tts": ...}}``. ``inner`` is
+        the inner-OOF DataFrame at the chosen pct (clean of outer-test);
+        ``cfc`` and ``tts`` are evaluation predictions at the chosen pct.
+    reduction_validation : pd.DataFrame
+        Inner-OOF classification report at every ``(fold, pct)`` evaluated.
+        Diagnostic view of the reduction-pct selection.
     """
     sample_weight = _balanced_sample_weight(y, pos_weight_factor=pos_weight_factor)
 
     # The early-stopping criterion and the final (fold, pct) ranking use
     # the same metric the HPO optimised. Falls back to MCC for callable
-    # scorers or unrecognised strings. Each metric is computed twice in
-    # the validation report: once on CFC (cross-fold competition; every
-    # fold_key evaluated on a shared, separately-seeded 4-fold grid) and
-    # once on TTS (true test set; each fold_key evaluated on the exact
-    # outer-fold split it was held out from during train()).
+    # scorers or unrecognised strings.
     metric_col = scoring_to_metric_column(scoring, default="MCC")
-    cfc_metric_col = f"{metric_col} CFC"
-    tts_metric_col = f"{metric_col} TTS"
     lower_better = metric_is_lower_better(metric_col)
-    _is_better = (
-        (lambda new, cur: new <= cur) if lower_better else (lambda new, cur: new >= cur)
-    )
     _idxbest = (lambda s: s.idxmin()) if lower_better else (lambda s: s.idxmax())
-    _worst_init = float("inf") if lower_better else float("-inf")
 
     # TTS splits — identical to train()'s outer CV. fold_key "fold_{i}"
     # was originally held out from tts_splits[i-1][1].
@@ -781,7 +856,7 @@ def nested_crossval(
     tts_splits = list(tts_kf.split(X, y.astype("str"), groups=outer_cv_groups))
 
     # CFC splits — separate fixed seed so the evaluation grid is independent
-    # of train()'s outer CV; all fold_key models compete on the same grid.
+    # of train()'s outer CV.
     if outer_cv_groups is not None:
         cfc_kf = StratifiedGroupKFold(
             n_splits=4, shuffle=True, random_state=cfc_random_state
@@ -794,84 +869,58 @@ def nested_crossval(
     n_cfc_splits = len(cfc_splits)
 
     def _tts_split_idx(fold_key):
-        """Recover the 0-indexed outer-fold position from a fold_key
-        like ``"fold_3"`` or ``"fold_3_LGBM"``."""
+        """0-indexed outer-fold position from a fold_key like ``"fold_3"``."""
         return int(fold_key.split("_")[1]) - 1
 
     # ------------------------------------------------------------------ #
-    # Valid reduction percentages                                        #
+    # Step 1 — pick best_pct per fold from inner OOF. Honest selector:   #
+    # inner OOF lives inside outer-train, never touches TTS.             #
     # ------------------------------------------------------------------ #
-    all_percentages = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
-    min_size = 2000
-    min_n_train = min(
-        min(len(train_idx) for train_idx, _ in cfc_splits),
-        min(len(train_idx) for train_idx, _ in tts_splits),
-    )
-
-    if min_n_train < min_size:
-        valid_pcts = [0.8, 0.9, 1.0]
-    else:
-        valid_pcts = [p for p in all_percentages if int(p * min_n_train) >= min_size]
-
-    # Per-fold-key pct list: kernel SVM only tests pcts where
-    # pct × min_n_train ≤ max_svm_samples to avoid O(n²) blowup.
-    fold_key_pcts: dict = {}
-    for fk, pipe in pipelines.items():
-        m = pipe.named_steps.get("model")
-        if m is not None and hasattr(m, "kernel"):
-            svm_pcts = [
-                p for p in valid_pcts if int(p * min_n_train) <= max_svm_samples
-            ]
-            if not svm_pcts:
-                # Dataset too large for any standard pct: one custom pct at the cap
-                svm_pcts = [round(max_svm_samples / min_n_train, 4)]
-            fold_key_pcts[fk] = svm_pcts
-            print(
-                f"[nested_crossval] {fk!r} kernel SVM — pcts: "
-                + ", ".join(
-                    f"{int(p * 100)}%" if p in all_percentages else f"{p:.2%}"
-                    for p in svm_pcts
-                )
-                + f" (≤ {max_svm_samples:,} samples)"
+    best_pct_per_fold: dict = {}
+    inner_reports: dict = {}
+    for fold_key, pct_to_df in inner_oof.items():
+        pct_scores = {}
+        for pct, df in pct_to_df.items():
+            rep = classification_report(
+                df["true"],
+                df["predicted"],
+                y_score=df["score"] if "score" in df.columns else None,
             )
-        else:
-            fold_key_pcts[fk] = valid_pcts
-
-    # Union of all pcts needed by any fold_key, sorted ascending
-    loop_pcts = sorted({p for pcts in fold_key_pcts.values() for p in pcts})
-
-    print(
-        "[nested_crossval] Reduction sizes: "
-        + ", ".join(
-            f"{int(p * 100)}%" if p in all_percentages else f"{p:.2%}"
-            for p in loop_pcts
+            inner_reports[(fold_key, pct)] = rep
+            pct_scores[pct] = rep[metric_col]
+        best_pct = _idxbest(pd.Series(pct_scores))
+        best_pct_per_fold[fold_key] = best_pct
+        print(
+            f"[nested_crossval] {fold_key}: best reduction={int(best_pct * 100)}% "
+            f"(inner-OOF {metric_col}={pct_scores[best_pct]:.4f})"
         )
+
+    reduction_validation = pd.DataFrame(
+        list(inner_reports.values()),
+        index=pd.MultiIndex.from_tuples(
+            list(inner_reports.keys()), names=["fold", "reduction"]
+        ),
     )
 
     # ------------------------------------------------------------------ #
-    # Incremental pct loop: parallel over active fold_keys per pct,      #
-    # with early stopping after two consecutive dips below best score.   #
+    # Step 2 — refit+predict at each fold's best_pct on CFC and TTS.     #
+    # CFC: n_cfc_splits fits per fold_key (~16 total).                   #
+    # TTS: 1 fit per fold_key (~4 total).                                #
     # ------------------------------------------------------------------ #
-    best_score_es: dict = {fk: _worst_init for fk in pipelines}
-    flagged_es: dict = {fk: False for fk in pipelines}
-    active_es: dict = {fk: True for fk in pipelines}
-    cfc_reduced_idx: dict = {}
-    tts_reduced_idx: dict = {}
-    pred_store_cfc: dict = {}
-    pred_store_tts: dict = {}
-    reports: dict = {}
+    cfc_reduced: dict = {}
+    tts_reduced: dict = {}
 
     def _reduce_for(train_index, pct, key, store):
         if (key, pct) in store:
             return
-        X_train = X.iloc[train_index]
-        y_train = y.iloc[train_index]
+        X_train_ = X.iloc[train_index]
+        y_train_ = y.iloc[train_index]
         if pct == 1.0:
-            store[(key, pct)] = X_train.index
+            store[(key, pct)] = X_train_.index
         else:
             store[(key, pct)] = reduce_dataset(
-                X=X_train,
-                y=y_train,
+                X=X_train_,
+                y=y_train_,
                 target_size=int(pct * len(train_index)),
                 stage2_shrink=1,
                 class_weight="balanced",
@@ -879,166 +928,115 @@ def nested_crossval(
                 verbose=False,
             )
 
-    for pct in loop_pcts:
-        active_keys = [
-            fk for fk in pipelines if active_es[fk] and pct in fold_key_pcts[fk]
-        ]
-        if not active_keys:
-            if not any(active_es[fk] for fk in pipelines):
-                break  # every fold_key has been early-stopped
-            continue  # some fold_keys still active but not at this pct
+    for fk in pipelines:
+        pct = best_pct_per_fold[fk]
+        for cfc_si in range(n_cfc_splits):
+            _reduce_for(cfc_splits[cfc_si][0], pct, cfc_si, cfc_reduced)
+        tts_si = _tts_split_idx(fk)
+        _reduce_for(tts_splits[tts_si][0], pct, tts_si, tts_reduced)
 
-        # Lazy-compute reduced indices for this pct on both grids.
-        for cfc_si, (train_index, _) in enumerate(cfc_splits):
-            _reduce_for(train_index, pct, cfc_si, cfc_reduced_idx)
+    cfc_tasks = [
+        (fk, cfc_si) for fk in pipelines for cfc_si in range(n_cfc_splits)
+    ]
+    tts_tasks = [(fk, _tts_split_idx(fk)) for fk in pipelines]
 
-        # TTS only needs the splits that match an active fold_key.
-        needed_tts_indices = {_tts_split_idx(fk) for fk in active_keys}
-        for tts_si in needed_tts_indices:
-            _reduce_for(tts_splits[tts_si][0], pct, tts_si, tts_reduced_idx)
-
-        # Build one parallel batch for both CFC and TTS fits.
-        cfc_tasks = [
-            (fk, cfc_si)
-            for fk in active_keys
-            for cfc_si in range(n_cfc_splits)
-        ]
-        tts_tasks = [(fk, _tts_split_idx(fk)) for fk in active_keys]
-
-        cfc_delayed = [
-            delayed(_fit_and_predict)(
-                pipelines[fk],
-                X,
-                y,
-                sample_weight,
-                cfc_splits[cfc_si][0],
-                cfc_splits[cfc_si][1],
-                cfc_reduced_idx[(cfc_si, pct)],
-            )
-            for fk, cfc_si in cfc_tasks
-        ]
-        tts_delayed = [
-            delayed(_fit_and_predict)(
-                pipelines[fk],
-                X,
-                y,
-                sample_weight,
-                tts_splits[tts_si][0],
-                tts_splits[tts_si][1],
-                tts_reduced_idx[(tts_si, pct)],
-            )
-            for fk, tts_si in tts_tasks
-        ]
-
-        results = Parallel(n_jobs=n_jobs)(cfc_delayed + tts_delayed)
-        n_cfc = len(cfc_tasks)
-        for (fk, cfc_si), df in zip(cfc_tasks, results[:n_cfc]):
-            pred_store_cfc[(fk, cfc_si, pct)] = df
-        for (fk, tts_si), df in zip(tts_tasks, results[n_cfc:]):
-            pred_store_tts[(fk, pct)] = df
-
-        # Aggregate per fold_key; build a combined CFC + TTS report.
-        for fold_key in active_keys:
-            cfc_preds = pd.concat(
-                [pred_store_cfc[(fold_key, si, pct)] for si in range(n_cfc_splits)],
-                axis=0,
-            )
-            cfc_report = classification_report(
-                cfc_preds["true"],
-                cfc_preds["predicted"],
-                y_score=cfc_preds["score"] if "score" in cfc_preds.columns else None,
-            )
-
-            tts_preds = pred_store_tts[(fold_key, pct)]
-            tts_report = classification_report(
-                tts_preds["true"],
-                tts_preds["predicted"],
-                y_score=tts_preds["score"] if "score" in tts_preds.columns else None,
-            )
-
-            # Suffix and concatenate so each metric appears twice in the row.
-            combined = pd.concat(
-                [cfc_report.add_suffix(" CFC"), tts_report.add_suffix(" TTS")]
-            )
-            reports[(fold_key, pct)] = combined
-
-            # Early stopping uses CFC (more data, lower variance).
-            score_val = combined[cfc_metric_col]
-
-            cmp = "<" if not lower_better else ">"
-            if not flagged_es[fold_key]:
-                if _is_better(score_val, best_score_es[fold_key]):
-                    best_score_es[fold_key] = score_val
-                else:
-                    flagged_es[fold_key] = True
-                    print(
-                        f"[nested_crossval] {fold_key!r} dip at {int(pct * 100)}%"
-                        f" ({cfc_metric_col}={score_val:.4f} {cmp} best={best_score_es[fold_key]:.4f})"
-                        " — giving one more chance …"
-                    )
-            else:
-                if _is_better(score_val, best_score_es[fold_key]):
-                    flagged_es[fold_key] = False
-                    best_score_es[fold_key] = score_val
-                else:
-                    active_es[fold_key] = False
-                    flagged_es[fold_key] = False
-                    print(
-                        f"[nested_crossval] Early stop {fold_key!r} at {int(pct * 100)}%"
-                        f" ({cfc_metric_col}={score_val:.4f} {cmp} best={best_score_es[fold_key]:.4f})"
-                    )
-
-    # ------------------------------------------------------------------ #
-    # Build validation table (CFC + TTS metrics, MultiIndex (fold, pct)).#
-    # ------------------------------------------------------------------ #
-    index_tuples = list(reports.keys())
-    validation = pd.DataFrame(
-        list(reports.values()),
-        index=pd.MultiIndex.from_tuples(
-            index_tuples, names=["fold", "reduction"]
-        ),
-    )
-
-    # ------------------------------------------------------------------ #
-    # Per-fold selection: each fold_key picks its own best CFC pct,      #
-    # gets refit, and returns its CFC+TTS OOF predictions. No single     #
-    # cross-fold winner — all outer-fold pipelines are deployable.       #
-    # ------------------------------------------------------------------ #
-    best_pipelines = {}
-    best_predictions = {}
-    for fold_key in pipelines:
-        fold_series = pd.Series(
-            {
-                pct: combined[cfc_metric_col]
-                for (fk, pct), combined in reports.items()
-                if fk == fold_key
-            }
-        )
-        if fold_series.empty:
-            continue
-        best_pct = _idxbest(fold_series)
-        best_score = fold_series[best_pct]
-        print(
-            f"[nested_crossval] {fold_key}: best reduction={int(best_pct * 100)}% "
-            f"({cfc_metric_col}={best_score:.4f}) — refitting …"
-        )
-        best_pipelines[fold_key] = _refit_pipeline(
-            pipelines[fold_key],
+    cfc_delayed = [
+        delayed(_fit_and_predict)(
+            pipelines[fk],
             X,
             y,
             sample_weight,
-            pct=best_pct,
+            cfc_splits[cfc_si][0],
+            cfc_splits[cfc_si][1],
+            cfc_reduced[(cfc_si, best_pct_per_fold[fk])],
+        )
+        for fk, cfc_si in cfc_tasks
+    ]
+    tts_delayed = [
+        delayed(_fit_and_predict)(
+            pipelines[fk],
+            X,
+            y,
+            sample_weight,
+            tts_splits[tts_si][0],
+            tts_splits[tts_si][1],
+            tts_reduced[(tts_si, best_pct_per_fold[fk])],
+        )
+        for fk, tts_si in tts_tasks
+    ]
+    results = Parallel(n_jobs=n_jobs)(cfc_delayed + tts_delayed)
+    n_cfc = len(cfc_tasks)
+
+    pred_store_cfc: dict = {}
+    for (fk, cfc_si), df in zip(cfc_tasks, results[:n_cfc]):
+        pred_store_cfc[(fk, cfc_si)] = df
+    pred_store_tts: dict = {}
+    for (fk, _), df in zip(tts_tasks, results[n_cfc:]):
+        pred_store_tts[fk] = df
+
+    # ------------------------------------------------------------------ #
+    # Step 3 — refit deployment pipeline on full X at each fold's pct.   #
+    # ------------------------------------------------------------------ #
+    best_pipelines: dict = {}
+    best_predictions: dict = {}
+    for fk in pipelines:
+        pct = best_pct_per_fold[fk]
+        print(
+            f"[nested_crossval] {fk}: refitting on full data at "
+            f"{int(pct * 100)}%"
+        )
+        best_pipelines[fk] = _refit_pipeline(
+            pipelines[fk],
+            X,
+            y,
+            sample_weight,
+            pct=pct,
             random_state=random_state,
             max_svm_samples=max_svm_samples,
         )
         cfc_oof = pd.concat(
-            [pred_store_cfc[(fold_key, si, best_pct)] for si in range(n_cfc_splits)],
-            axis=0,
+            [pred_store_cfc[(fk, si)] for si in range(n_cfc_splits)], axis=0,
         )
-        tts_oof = pred_store_tts[(fold_key, best_pct)]
-        best_predictions[fold_key] = {"cfc": cfc_oof, "tts": tts_oof}
+        best_predictions[fk] = {
+            "inner": inner_oof[fk][pct],
+            "cfc": cfc_oof,
+            "tts": pred_store_tts[fk],
+        }
 
-    return validation, best_pipelines, best_predictions
+    # ------------------------------------------------------------------ #
+    # Step 4 — validation table: raw CFC + TTS at each fold's pct.       #
+    # (Calibration / threshold variants live in magic_now.)              #
+    # ------------------------------------------------------------------ #
+    validation_rows: list = []
+    validation_index: list = []
+    for fk in pipelines:
+        pct = best_pct_per_fold[fk]
+        cfc_oof = best_predictions[fk]["cfc"]
+        tts_oof = best_predictions[fk]["tts"]
+        cfc_rep = classification_report(
+            cfc_oof["true"],
+            cfc_oof["predicted"],
+            y_score=cfc_oof["score"] if "score" in cfc_oof.columns else None,
+        )
+        tts_rep = classification_report(
+            tts_oof["true"],
+            tts_oof["predicted"],
+            y_score=tts_oof["score"] if "score" in tts_oof.columns else None,
+        )
+        combined = pd.concat(
+            [cfc_rep.add_suffix(" CFC"), tts_rep.add_suffix(" TTS")]
+        )
+        validation_rows.append(combined)
+        validation_index.append((fk, pct))
+
+    validation = pd.DataFrame(
+        validation_rows,
+        index=pd.MultiIndex.from_tuples(
+            validation_index, names=["fold", "reduction"]
+        ),
+    )
+
+    return validation, best_pipelines, best_predictions, reduction_validation
 
 
 def magic_now(
@@ -1119,7 +1117,7 @@ def magic_now(
             header=True,
         )
 
-    pipelines, studies = train(
+    pipelines, studies, inner_oof = train(
         X=X,
         y=y,
         scoring=scoring,
@@ -1136,15 +1134,18 @@ def magic_now(
         pos_weight_factor=pos_weight_factor,
     )
 
-    reduction_validation, pipeline_by_fold, predictions_by_fold = nested_crossval(
-        X=X,
-        y=y,
-        pipelines=pipelines,
-        scoring=scoring,
-        outer_cv_groups=outer_cv_groups,
-        n_jobs=n_jobs,
-        pos_weight_factor=pos_weight_factor,
-        cfc_random_state=cfc_random_state,
+    validation, pipeline_by_fold, predictions_by_fold, reduction_validation = (
+        nested_crossval(
+            X=X,
+            y=y,
+            pipelines=pipelines,
+            inner_oof=inner_oof,
+            scoring=scoring,
+            outer_cv_groups=outer_cv_groups,
+            n_jobs=n_jobs,
+            pos_weight_factor=pos_weight_factor,
+            cfc_random_state=cfc_random_state,
+        )
     )
 
     # Keep an uncalibrated reference for the calibration-variants diagnostic
@@ -1156,10 +1157,10 @@ def magic_now(
 
     # ---------------------------------------------------------------------#
     # Optional calibration + threshold tuning per outer-fold model.        #
-    # Score-level: ScoreCalibrator is fit on the CFC OOF scores already    #
-    # produced by nested_crossval — zero extra model fits. The calibrator  #
-    # is applied to both the CFC and TTS score arrays so the per-variant   #
-    # validation rows carry CFC + TTS metric columns on equal footing.     #
+    # Score-level: ScoreCalibrator is fit on the INNER OOF scores produced #
+    # inside outer-train (never touches TTS rows). Calibrator and threshold#
+    # are then applied to CFC + TTS scores for honest evaluation, and to   #
+    # the inner OOF itself for the threshold scan.                          #
     # ---------------------------------------------------------------------#
     evaluation_rows: list = []
     evaluation_index: list = []
@@ -1170,25 +1171,29 @@ def magic_now(
             oof = predictions_by_fold.get(fold_key)
             if oof is None:
                 continue
+            inner_df = oof["inner"]
             cfc_df = oof["cfc"]
             tts_df = oof["tts"]
+
+            inner_true = inner_df["true"].to_numpy().astype(int)
+            inner_score_raw = inner_df["score"].to_numpy(dtype=float)
+            inner_weights = sample_weight.loc[inner_df.index].to_numpy()
 
             cfc_true = cfc_df["true"].to_numpy().astype(int)
             cfc_pred_raw = cfc_df["predicted"].to_numpy().astype(int)
             cfc_score_raw = cfc_df["score"].to_numpy(dtype=float)
-            cfc_weights = sample_weight.loc[cfc_df.index].to_numpy()
 
             tts_true = tts_df["true"].to_numpy().astype(int)
             tts_pred_raw = tts_df["predicted"].to_numpy().astype(int)
             tts_score_raw = tts_df["score"].to_numpy(dtype=float)
 
-            # ----- pick + fit calibrator on CFC OOF (zero model fits) -----
+            # ----- pick + fit calibrator on INNER OOF (honest, no leak) -----
             calibrated_method = None
             if calibration == "auto":
                 calibrated_method, brier = pick_best_score_calibration_method(
-                    cfc_true,
-                    cfc_score_raw,
-                    sample_weight=cfc_weights,
+                    inner_true,
+                    inner_score_raw,
+                    sample_weight=inner_weights,
                     random_state=random_state,
                 )
                 print(
@@ -1200,27 +1205,30 @@ def magic_now(
 
             if calibrated_method is not None:
                 calibrator = fit_score_calibrator(
-                    cfc_true,
-                    cfc_score_raw,
+                    inner_true,
+                    inner_score_raw,
                     method=calibrated_method,
-                    sample_weight=cfc_weights,
+                    sample_weight=inner_weights,
                 )
+                inner_score_cal = calibrator.predict(inner_score_raw)
                 cfc_score_cal = calibrator.predict(cfc_score_raw)
                 tts_score_cal = calibrator.predict(tts_score_raw)
                 print(f"[magic_now] {fold_key}: calibrated ({calibrated_method}).")
             else:
                 calibrator = None
+                inner_score_cal = inner_score_raw
                 cfc_score_cal = cfc_score_raw
                 tts_score_cal = tts_score_raw
 
             cfc_pred_cal_05 = (cfc_score_cal >= 0.5).astype(int)
             tts_pred_cal_05 = (tts_score_cal >= 0.5).astype(int)
 
+            # ----- threshold tuned on calibrated INNER OOF (still honest) ---
             calibrated_threshold = 0.5
             if optimize_threshold:
                 calibrated_threshold, threshold_score, used_metric = (
                     find_best_threshold(
-                        cfc_true, cfc_score_cal, metric=scoring
+                        inner_true, inner_score_cal, metric=scoring
                     )
                 )
                 print(
@@ -1277,7 +1285,9 @@ def magic_now(
         validation = pd.DataFrame(evaluation_rows, index=evaluation_index)
         validation.index.name = "fold"
     else:
-        validation = reduction_validation.copy()
+        # nested_crossval already produced the raw CFC+TTS validation table
+        # for each fold's best pct; just label the rows.
+        validation = validation.copy()
         validation["label"] = "raw model"
 
     # ---------------------------------------------------------------------#
