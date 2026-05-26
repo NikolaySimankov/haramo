@@ -44,11 +44,11 @@ from ..utils import (
     plot_roc_curve,
     plot_ks_statistic,
     plot_calibration_curve,
-    calibrate_pipeline,
-    pick_best_calibration_method,
+    fit_score_calibrator,
+    pick_best_score_calibration_method,
     find_best_threshold,
     compute_calibration_variants,
-    ThresholdedClassifier,
+    CalibratedThresholdedClassifier,
 )
 from ..feature_selection import select_best_dataset_combo, select_best_feature_selector
 
@@ -928,15 +928,15 @@ def nested_crossval(
         competition, concatenated across the cfc_splits grid) and
         ``" TTS"`` (true test set, the fold_key's original held-out
         outer-fold split).
-    best_pipeline : Pipeline or list of Pipeline
-        Single best pipeline or one per algorithm (per-algorithm mode).
-    best_predictions : dict or list of dict
-        Per-outer-fold model predictions ``{fold_key -> DataFrame[true,
-        predicted, score]}``. Each entry concatenates the n_splits test
-        folds for that model at its own best reduction pct, so the dict
-        contains one row per competing model (typically 4). In per-algorithm
-        mode, an ordered list aligned with ``algorithms``. Suitable input
-        for ``plot_pr_curve`` / ``plot_roc_curve``.
+    best_pipelines : dict[str, Pipeline]
+        One refitted pipeline per fold_key, each at its own best CFC pct.
+        Keys are ``"fold_{i}"`` in single mode, ``"fold_{i}_{alg}"`` in
+        per-algorithm mode.
+    best_predictions : dict[str, dict[str, pd.DataFrame]]
+        ``{fold_key: {"cfc": cfc_oof_df, "tts": tts_oof_df}}``. CFC is the
+        concatenation across cfc_splits at the fold's best pct; TTS is the
+        single OOF DataFrame from the fold_key's original outer-fold split.
+        Both DataFrames have columns ``["true", "predicted", "score"]``.
     """
     sample_weight = _balanced_sample_weight(y, pos_weight_factor=pos_weight_factor)
 
@@ -1178,7 +1178,7 @@ def nested_crossval(
                     )
 
     # ------------------------------------------------------------------ #
-    # Per-algorithm mode                                                 #
+    # Build validation table (CFC + TTS metrics, MultiIndex as usual).   #
     # ------------------------------------------------------------------ #
     if algorithms is not None:
         index_tuples, rows = [], []
@@ -1187,85 +1187,61 @@ def nested_crossval(
                 if fold_key.endswith(f"_{alg}"):
                     index_tuples.append((alg, fold_key, pct))
                     rows.append(report)
-
         validation = pd.DataFrame(
             rows,
             index=pd.MultiIndex.from_tuples(
                 index_tuples, names=["algorithm", "fold", "reduction"]
             ),
         )
-
-        best_pipelines = []
-        best_predictions = []
-        for alg in algorithms:
-            alg_df = validation.loc[alg]
-            best_fold_key, best_pct = _idxbest(alg_df[cfc_metric_col])
-            best_score = alg_df.loc[(best_fold_key, best_pct), cfc_metric_col]
-            print(
-                f"[nested_crossval] {alg}: best fold={best_fold_key!r} "
-                f"@ {int(best_pct * 100)}% ({cfc_metric_col}={best_score:.4f}) "
-                f"— refitting …"
-            )
-            best_pipelines.append(
-                _refit_pipeline(
-                    pipelines[best_fold_key],
-                    X,
-                    y,
-                    sample_weight,
-                    pct=best_pct,
-                    random_state=random_state,
-                    max_svm_samples=max_svm_samples,
-                )
-            )
-            # Surface every competing outer-fold model for this algorithm at
-            # its own best pct, CFC-concatenated across the eval grid.
-            alg_predictions = {}
-            for fk in alg_df.index.get_level_values("fold").unique():
-                fk_best_pct = _idxbest(alg_df.loc[fk, cfc_metric_col])
-                alg_predictions[fk] = pd.concat(
-                    [pred_store_cfc[(fk, si, fk_best_pct)] for si in range(n_cfc_splits)],
-                    axis=0,
-                )
-            best_predictions.append(alg_predictions)
-
-        return validation, best_pipelines, best_predictions
-
-    # ------------------------------------------------------------------ #
-    # Single-algorithm mode                                              #
-    # ------------------------------------------------------------------ #
-    index_tuples = list(reports.keys())
-    validation = pd.DataFrame(
-        list(reports.values()),
-        index=pd.MultiIndex.from_tuples(index_tuples, names=["fold", "reduction"]),
-    )
-
-    best_fold, best_pct = _idxbest(validation[cfc_metric_col])
-    best_score = validation.loc[(best_fold, best_pct), cfc_metric_col]
-    print(
-        f"[nested_crossval] Best: {best_fold!r} @ {int(best_pct * 100)}% "
-        f"({cfc_metric_col}={best_score:.4f}) — refitting …"
-    )
-    best_model = _refit_pipeline(
-        pipelines[best_fold],
-        X,
-        y,
-        sample_weight,
-        pct=best_pct,
-        random_state=random_state,
-        max_svm_samples=max_svm_samples,
-    )
-
-    # Surface every competing outer-fold model at its own best pct,
-    # CFC-concatenated across the eval grid.
-    best_predictions = {}
-    for fk in validation.index.get_level_values("fold").unique():
-        fk_best_pct = _idxbest(validation.loc[fk, cfc_metric_col])
-        best_predictions[fk] = pd.concat(
-            [pred_store_cfc[(fk, si, fk_best_pct)] for si in range(n_cfc_splits)],
-            axis=0,
+    else:
+        index_tuples = list(reports.keys())
+        validation = pd.DataFrame(
+            list(reports.values()),
+            index=pd.MultiIndex.from_tuples(
+                index_tuples, names=["fold", "reduction"]
+            ),
         )
 
-    return validation, best_model, best_predictions
+    # ------------------------------------------------------------------ #
+    # Per-fold selection: each fold_key picks its own best CFC pct,      #
+    # gets refit, and returns its CFC+TTS OOF predictions. No single     #
+    # cross-fold winner — all outer-fold pipelines are deployable.       #
+    # ------------------------------------------------------------------ #
+    best_pipelines = {}
+    best_predictions = {}
+    for fold_key in pipelines:
+        fold_series = pd.Series(
+            {
+                pct: combined[cfc_metric_col]
+                for (fk, pct), combined in reports.items()
+                if fk == fold_key
+            }
+        )
+        if fold_series.empty:
+            continue
+        best_pct = _idxbest(fold_series)
+        best_score = fold_series[best_pct]
+        print(
+            f"[nested_crossval] {fold_key}: best reduction={int(best_pct * 100)}% "
+            f"({cfc_metric_col}={best_score:.4f}) — refitting …"
+        )
+        best_pipelines[fold_key] = _refit_pipeline(
+            pipelines[fold_key],
+            X,
+            y,
+            sample_weight,
+            pct=best_pct,
+            random_state=random_state,
+            max_svm_samples=max_svm_samples,
+        )
+        cfc_oof = pd.concat(
+            [pred_store_cfc[(fold_key, si, best_pct)] for si in range(n_cfc_splits)],
+            axis=0,
+        )
+        tts_oof = pred_store_tts[(fold_key, best_pct)]
+        best_predictions[fold_key] = {"cfc": cfc_oof, "tts": tts_oof}
+
+    return validation, best_pipelines, best_predictions
 
 
 def magic_now(
@@ -1365,7 +1341,7 @@ def magic_now(
         pos_weight_factor=pos_weight_factor,
     )
 
-    validation, pipeline, predictions = nested_crossval(
+    reduction_validation, pipeline_by_fold, predictions_by_fold = nested_crossval(
         X=X,
         y=y,
         pipelines=pipelines,
@@ -1377,124 +1353,147 @@ def magic_now(
         cfc_random_state=cfc_random_state,
     )
 
-    # Keep a reference to the uncalibrated pipeline(s) for the calibration
-    # variants diagnostic plot. The `pipeline` variable below may be replaced
-    # by a CalibratedClassifierCV / ThresholdedClassifier wrapper.
-    uncalibrated_pipeline = list(pipeline) if per_alg_mode else pipeline
+    # Keep an uncalibrated reference for the calibration-variants diagnostic
+    # plot; calibrated_artifacts below wraps each pipeline in
+    # CalibratedThresholdedClassifier when calibration/threshold are on.
+    uncalibrated_pipeline = dict(pipeline_by_fold)
 
-    # Computed once and reused by both the calibration block (if enabled)
-    # and the calibration variants plot.
     sample_weight = _balanced_sample_weight(y, pos_weight_factor=pos_weight_factor)
 
     # ---------------------------------------------------------------------#
-    # Optional calibration + threshold tuning on the winning pipeline(s).  #
-    # HPO loops are untouched; this only adds a handful of fits at the     #
-    # end of the run. When calibration is off, threshold tuning uses the   #
-    # uncalibrated OOF predictions from nested_crossval (free).            #
+    # Optional calibration + threshold tuning per outer-fold model.        #
+    # Score-level: ScoreCalibrator is fit on the CFC OOF scores already    #
+    # produced by nested_crossval — zero extra model fits. The calibrator  #
+    # is applied to both the CFC and TTS score arrays so the per-variant   #
+    # validation rows carry CFC + TTS metric columns on equal footing.     #
     # ---------------------------------------------------------------------#
+    evaluation_rows: list = []
+    evaluation_index: list = []
+    calibrated_artifacts: dict = {}
+
     if calibration is not None or optimize_threshold:
+        for fold_key, fold_pipeline in pipeline_by_fold.items():
+            oof = predictions_by_fold.get(fold_key)
+            if oof is None:
+                continue
+            cfc_df = oof["cfc"]
+            tts_df = oof["tts"]
 
-        def _make_cv():
-            if outer_cv_groups is not None:
-                return StratifiedGroupKFold(n_splits=4).split(
-                    X, y.astype("str"), groups=outer_cv_groups
-                )
-            return StratifiedKFold(
-                n_splits=4,
-                shuffle=True,
-                random_state=random_state,
-            ).split(X, y.astype("str"))
+            cfc_true = cfc_df["true"].to_numpy().astype(int)
+            cfc_pred_raw = cfc_df["predicted"].to_numpy().astype(int)
+            cfc_score_raw = cfc_df["score"].to_numpy(dtype=float)
+            cfc_weights = sample_weight.loc[cfc_df.index].to_numpy()
 
-        def _calibrate_and_threshold(pipe, oof_df, label):
+            tts_true = tts_df["true"].to_numpy().astype(int)
+            tts_pred_raw = tts_df["predicted"].to_numpy().astype(int)
+            tts_score_raw = tts_df["score"].to_numpy(dtype=float)
+
+            # ----- pick + fit calibrator on CFC OOF (zero model fits) -----
             calibrated_method = None
-
             if calibration == "auto":
-                calibrated_method, brier = pick_best_calibration_method(
-                    pipe,
-                    X,
-                    y,
-                    sample_weight,
+                calibrated_method, brier = pick_best_score_calibration_method(
+                    cfc_true,
+                    cfc_score_raw,
+                    sample_weight=cfc_weights,
                     random_state=random_state,
                 )
                 print(
-                    f"[magic_now] {label}: auto-picked calibration="
+                    f"[magic_now] {fold_key}: auto-picked calibration="
                     f"{calibrated_method!r} (Brier={brier:.4f})."
                 )
-
             elif calibration in ("isotonic", "sigmoid"):
                 calibrated_method = calibration
 
             if calibrated_method is not None:
-                pipe = calibrate_pipeline(
-                    pipe,
-                    X,
-                    y,
-                    sample_weight,
+                calibrator = fit_score_calibrator(
+                    cfc_true,
+                    cfc_score_raw,
                     method=calibrated_method,
-                    cv=4,
+                    sample_weight=cfc_weights,
                 )
-                print(f"[magic_now] {label}: calibrated ({calibrated_method}).")
+                cfc_score_cal = calibrator.predict(cfc_score_raw)
+                tts_score_cal = calibrator.predict(tts_score_raw)
+                print(f"[magic_now] {fold_key}: calibrated ({calibrated_method}).")
+            else:
+                calibrator = None
+                cfc_score_cal = cfc_score_raw
+                tts_score_cal = tts_score_raw
 
+            cfc_pred_cal_05 = (cfc_score_cal >= 0.5).astype(int)
+            tts_pred_cal_05 = (tts_score_cal >= 0.5).astype(int)
+
+            calibrated_threshold = 0.5
             if optimize_threshold:
-                if calibrated_method is not None:
-                    cv = list(_make_cv())
-
-                    y_score_arr = cross_val_predict(
-                        clone(pipe),
-                        X,
-                        y,
-                        cv=cv,
-                        method="predict_proba",
-                        n_jobs=n_jobs,
-                    )[:, 1]
-
-                    y_true_arr = np.asarray(y)
-
-                else:
-                    y_true_arr = oof_df["true"].to_numpy()
-                    y_score_arr = oof_df["score"].to_numpy()
-
-                threshold, threshold_score, used_metric = find_best_threshold(
-                    y_true_arr,
-                    y_score_arr,
-                    metric=scoring,
+                calibrated_threshold, threshold_score, used_metric = (
+                    find_best_threshold(
+                        cfc_true, cfc_score_cal, metric=scoring
+                    )
                 )
-
-                pipe = ThresholdedClassifier(pipe, threshold=threshold)
-
                 print(
-                    f"[magic_now] {label}: threshold={threshold:.3f} "
+                    f"[magic_now] {fold_key}: threshold={calibrated_threshold:.3f} "
                     f"({used_metric}={threshold_score:.4f})."
                 )
 
-            return pipe
+            cfc_pred_cal_thr = (cfc_score_cal >= calibrated_threshold).astype(int)
+            tts_pred_cal_thr = (tts_score_cal >= calibrated_threshold).astype(int)
 
-        if per_alg_mode:
-            pipeline = [
-                _calibrate_and_threshold(
-                    pipe,
-                    pd.concat(list(preds.values()), axis=0),
-                    alg,
-                )
-                for alg, pipe, preds in zip(algorithm, pipeline, predictions)
+            variant_specs = [
+                (
+                    "raw model",
+                    cfc_pred_raw, cfc_score_raw,
+                    tts_pred_raw, tts_score_raw,
+                ),
+                (
+                    "calibrated model",
+                    cfc_pred_cal_05, cfc_score_cal,
+                    tts_pred_cal_05, tts_score_cal,
+                ),
             ]
-        else:
-            oof = pd.concat(list(predictions.values()), axis=0)
-            pipeline = _calibrate_and_threshold(pipeline, oof, "single")
+            if optimize_threshold:
+                variant_specs.append(
+                    (
+                        "calibrated model with threshold",
+                        cfc_pred_cal_thr, cfc_score_cal,
+                        tts_pred_cal_thr, tts_score_cal,
+                    )
+                )
 
-    # ---------------------------------------------------------------------#
-    # Persist pipelines                                                    #
-    # Per-algorithm mode: one file per algorithm named pipelines_{alg}.pkl #
-    # Single mode: one file named pipelines.pkl (unchanged)                #
-    # ---------------------------------------------------------------------#
+            for label, c_pred, c_score, t_pred, t_score in variant_specs:
+                cfc_report = classification_report(
+                    cfc_true, c_pred, y_score=c_score
+                )
+                tts_report = classification_report(
+                    tts_true, t_pred, y_score=t_score
+                )
+                combined = pd.concat(
+                    [cfc_report.add_suffix(" CFC"), tts_report.add_suffix(" TTS")]
+                )
+                combined["label"] = label
+                combined["calibration_method"] = calibrated_method
+                combined["threshold"] = calibrated_threshold
+                evaluation_rows.append(combined)
+                evaluation_index.append(fold_key)
 
-    if per_alg_mode:
-        for alg, pipe in zip(algorithm, pipeline):
-            with open(models_dir / f"pipelines_{alg}{tag}.pkl", "wb") as handle:
-                pickle.dump(pipe, handle)
+            calibrated_artifacts[fold_key] = CalibratedThresholdedClassifier(
+                pipeline=fold_pipeline,
+                calibrator=calibrator,
+                threshold=calibrated_threshold,
+            )
+
+        validation = pd.DataFrame(evaluation_rows, index=evaluation_index)
+        validation.index.name = "fold"
     else:
-        with open(models_dir / f"pipelines{tag}.pkl", "wb") as handle:
-            pickle.dump(pipeline, handle)
+        validation = reduction_validation.copy()
+        validation["label"] = "raw model"
+
+    # ---------------------------------------------------------------------#
+    # Persist artefacts. Single pickle keyed by fold_key; values are       #
+    # CalibratedThresholdedClassifier (when calibration/threshold are on)  #
+    # or bare pipelines (otherwise). Both expose the sklearn API.          #
+    # ---------------------------------------------------------------------#
+    model_payload = calibrated_artifacts if calibrated_artifacts else pipeline_by_fold
+    with open(models_dir / f"pipelines{tag}.pkl", "wb") as handle:
+        pickle.dump(model_payload, handle)
 
     with open(
         trials_dir / f"studies{tag}.pkl",
@@ -1503,64 +1502,72 @@ def magic_now(
         pickle.dump(studies, handle)
 
     # ---------------------------------------------------------------------#
-    # PR / ROC curve plots — one curve per outer-fold model, mean +/- std  #
+    # Plots: CFC OOF feeds PR / ROC / KS (more samples per curve).         #
+    # Calibration variants stay refit-based per fold_key.                  #
     # ---------------------------------------------------------------------#
-
     if plots:
         if per_alg_mode:
-            for alg, preds, uncal_pipe in zip(
-                algorithm, predictions, uncalibrated_pipeline
-            ):
+            for alg in algorithm:
+                alg_cfc = {
+                    fk: oof["cfc"]
+                    for fk, oof in predictions_by_fold.items()
+                    if fk.endswith(f"_{alg}")
+                }
+                if not alg_cfc:
+                    continue
                 plot_pr_curve(
-                    preds,
+                    alg_cfc,
                     plots_dir / f"pr_curve_{alg}{tag}.pdf",
                     title=f"PR curve — {alg}",
                 )
                 plot_roc_curve(
-                    preds,
+                    alg_cfc,
                     plots_dir / f"roc_curve_{alg}{tag}.pdf",
                     title=f"ROC curve — {alg}",
                 )
                 plot_ks_statistic(
-                    preds,
+                    alg_cfc,
                     plots_dir / f"ks_statistic_{alg}{tag}.pdf",
                     title=f"KS statistic — {alg}",
                 )
-                variants = compute_calibration_variants(
-                    uncal_pipe, X, y, sample_weight, random_state=random_state
-                )
-                plot_calibration_curve(
-                    variants,
-                    plots_dir / f"calibration_curve_{alg}{tag}.pdf",
-                    title=f"Calibration plots — {alg}",
-                )
         else:
+            cfc_only = {
+                fk: oof["cfc"] for fk, oof in predictions_by_fold.items()
+            }
             plot_pr_curve(
-                predictions, plots_dir / f"pr_curve{tag}.pdf", title="PR curve"
+                cfc_only, plots_dir / f"pr_curve{tag}.pdf", title="PR curve"
             )
             plot_roc_curve(
-                predictions, plots_dir / f"roc_curve{tag}.pdf", title="ROC curve"
+                cfc_only, plots_dir / f"roc_curve{tag}.pdf", title="ROC curve"
             )
             plot_ks_statistic(
-                predictions, plots_dir / f"ks_statistic{tag}.pdf", title="KS statistic"
+                cfc_only,
+                plots_dir / f"ks_statistic{tag}.pdf",
+                title="KS statistic",
             )
+
+        for fold_key, uncal_pipe in uncalibrated_pipeline.items():
             variants = compute_calibration_variants(
-                uncalibrated_pipeline, X, y, sample_weight, random_state=random_state
+                uncal_pipe, X, y, sample_weight, random_state=random_state,
             )
             plot_calibration_curve(
                 variants,
-                plots_dir / f"calibration_curve{tag}.pdf",
-                title="Calibration plots",
+                plots_dir / f"calibration_curve_{fold_key}{tag}.pdf",
+                title=f"Calibration plots — {fold_key}",
             )
 
     n_1 = int((y == 1).sum())
     n_0 = int((y == 0).sum())
-    validation["positives"] = n_1
-    validation["negatives"] = n_0
-    validation["class_imbalance"] = round(n_1 / n_0, 4) if n_0 > 0 else float("inf")
-    if outer_cv_groups is not None:
-        validation["n_groups"] = int(pd.Series(outer_cv_groups).nunique())
+    for tbl in (validation, reduction_validation):
+        tbl["positives"] = n_1
+        tbl["negatives"] = n_0
+        tbl["class_imbalance"] = round(n_1 / n_0, 4) if n_0 > 0 else float("inf")
+        if outer_cv_groups is not None:
+            tbl["n_groups"] = int(pd.Series(outer_cv_groups).nunique())
 
+    reduction_validation.to_csv(
+        results_dir / f"reduction_validation{tag}.tsv", sep="\t", index=True
+    )
     validation.to_csv(results_dir / f"validation{tag}.tsv", sep="\t", index=True)
 
     # ---------------------------------------------------------------------#
@@ -1596,4 +1603,4 @@ def magic_now(
         print("[magic_now] Best hyperparameters per algorithm:")
         print(best_params_df.to_string())
 
-    return validation, pipeline, studies
+    return validation, model_payload, studies

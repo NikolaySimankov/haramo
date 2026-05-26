@@ -6,6 +6,8 @@ import numpy as np
 
 from sklearn.base import BaseEstimator, ClassifierMixin, clone
 from sklearn.calibration import CalibratedClassifierCV, calibration_curve
+from sklearn.isotonic import IsotonicRegression
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     brier_score_loss,
     matthews_corrcoef,
@@ -13,7 +15,7 @@ from sklearn.metrics import (
     balanced_accuracy_score,
     cohen_kappa_score,
 )
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import StratifiedKFold, train_test_split
 
 import matplotlib.pyplot as plt
 
@@ -26,9 +28,7 @@ class ThresholdedClassifier(BaseEstimator, ClassifierMixin):
     """Wraps a fitted classifier and applies a custom decision threshold.
 
     ``predict_proba`` is delegated unchanged; ``predict`` returns 1 when the
-    positive-class probability is ``>= threshold``, else 0. Used by
-    ``magic_now`` when ``optimize_threshold=True`` so the saved model behaves
-    as a sklearn classifier with the tuned cutoff baked in.
+    positive-class probability is ``>= threshold``, else 0.
     """
 
     def __init__(self, estimator, threshold=0.5):
@@ -52,6 +52,111 @@ class ThresholdedClassifier(BaseEstimator, ClassifierMixin):
     @property
     def classes_(self):
         return self.estimator.classes_
+
+
+class ScoreCalibrator(BaseEstimator):
+    """Learn a 1-D mapping ``score → calibrated_probability``.
+
+    Operates directly on a 1-D score array (positive-class probability or
+    decision_function output) rather than on a feature matrix. Intended for
+    nested-CV workflows where the base model is trained separately and
+    calibration is fit on its out-of-fold scores — no pipeline refits.
+    """
+
+    def __init__(self, method="isotonic"):
+        self.method = method
+
+    def fit(self, y_true, y_score, sample_weight=None):
+        y_true = np.asarray(y_true).astype(int)
+        y_score = np.asarray(y_score, dtype=float).reshape(-1)
+
+        if self.method == "isotonic":
+            calibrator = IsotonicRegression(out_of_bounds="clip")
+            try:
+                calibrator.fit(y_score, y_true, sample_weight=sample_weight)
+            except TypeError:
+                calibrator.fit(y_score, y_true)
+        elif self.method == "sigmoid":
+            calibrator = LogisticRegression(max_iter=1000, solver="lbfgs")
+            X_score = y_score.reshape(-1, 1)
+            try:
+                calibrator.fit(X_score, y_true, sample_weight=sample_weight)
+            except TypeError:
+                calibrator.fit(X_score, y_true)
+        else:
+            raise ValueError("method must be 'isotonic' or 'sigmoid'")
+
+        self.calibrator_ = calibrator
+        return self
+
+    def predict(self, y_score):
+        y_score = np.asarray(y_score, dtype=float).reshape(-1)
+        if self.method == "isotonic":
+            return np.clip(
+                np.asarray(self.calibrator_.predict(y_score), dtype=float), 0.0, 1.0
+            )
+        if self.method == "sigmoid":
+            proba = self.calibrator_.predict_proba(y_score.reshape(-1, 1))
+            return np.clip(np.asarray(proba[:, 1], dtype=float), 0.0, 1.0)
+        raise ValueError("method must be 'isotonic' or 'sigmoid'")
+
+    def predict_proba(self, y_score):
+        calibrated = self.predict(y_score)
+        return np.column_stack([1.0 - calibrated, calibrated])
+
+
+class CalibratedThresholdedClassifier(BaseEstimator, ClassifierMixin):
+    """Sklearn-compatible deployment wrapper: ``pipeline → calibrator → threshold``.
+
+    Pickled artefact produced by ``magic_now`` when calibration and/or
+    threshold tuning are enabled. Applies the same decision logic at
+    inference as the per-fold magic_now diagnostics:
+
+    1. ``pipeline`` produces raw positive-class scores (``predict_proba[:, 1]``
+       or ``decision_function`` fallback).
+    2. Optional ``calibrator`` (a :class:`ScoreCalibrator`) maps raw → calibrated.
+    3. ``predict`` thresholds the calibrated probability.
+
+    ``calibrator`` / ``threshold`` are typically fit on out-of-fold predictions
+    from ``nested_crossval`` and should NOT be re-derived on the training set.
+    ``fit(X, y)`` only refits the underlying pipeline.
+    """
+
+    def __init__(self, pipeline, calibrator=None, threshold=0.5):
+        self.pipeline = pipeline
+        self.calibrator = calibrator
+        self.threshold = threshold
+
+    def fit(self, X, y, **kw):
+        self.pipeline.fit(X, y, **kw)
+        return self
+
+    def _raw_positive_score(self, X):
+        if hasattr(self.pipeline, "predict_proba"):
+            proba = self.pipeline.predict_proba(X)
+            if proba.ndim == 2 and proba.shape[1] >= 2:
+                return proba[:, 1]
+            return proba.ravel()
+        if hasattr(self.pipeline, "decision_function"):
+            return self.pipeline.decision_function(X)
+        raise ValueError(
+            "Underlying pipeline has neither predict_proba nor decision_function"
+        )
+
+    def predict_proba(self, X):
+        raw = self._raw_positive_score(X)
+        if self.calibrator is not None:
+            cal = self.calibrator.predict(raw)
+        else:
+            cal = np.clip(np.asarray(raw, dtype=float), 0.0, 1.0)
+        return np.column_stack([1.0 - cal, cal])
+
+    def predict(self, X):
+        return (self.predict_proba(X)[:, 1] >= self.threshold).astype(int)
+
+    @property
+    def classes_(self):
+        return self.pipeline.classes_
 
 
 #############
@@ -106,6 +211,51 @@ def pick_best_calibration_method(
         if b < best_brier:
             best, best_brier = method, b
     return best, best_brier
+
+
+def fit_score_calibrator(y_true, y_score, method="isotonic", sample_weight=None):
+    """Fit a :class:`ScoreCalibrator` on out-of-fold scores."""
+    return ScoreCalibrator(method=method).fit(
+        y_true=y_true, y_score=y_score, sample_weight=sample_weight
+    )
+
+
+def pick_best_score_calibration_method(
+    y_true, y_score, sample_weight=None, random_state=42, cv=4
+):
+    """Pick ``isotonic`` vs ``sigmoid`` by Brier on stratified k-fold splits
+    of the OOF score array.
+
+    Operates entirely on the 1-D ``(y_true, y_score)`` arrays produced by
+    ``nested_crossval`` — **no model refits**. Returns ``(best_method,
+    best_brier)`` where ``best_brier`` is the mean of held-out Brier across
+    the k folds.
+    """
+    y_true = np.asarray(y_true).astype(int)
+    y_score = np.asarray(y_score, dtype=float)
+    if sample_weight is not None:
+        sample_weight = np.asarray(sample_weight, dtype=float)
+
+    kf = StratifiedKFold(n_splits=cv, shuffle=True, random_state=random_state)
+    brier_scores = {"isotonic": [], "sigmoid": []}
+
+    for train_idx, test_idx in kf.split(y_score, y_true):
+        y_tr, y_te = y_true[train_idx], y_true[test_idx]
+        s_tr, s_te = y_score[train_idx], y_score[test_idx]
+        sw_tr = sample_weight[train_idx] if sample_weight is not None else None
+        for method in ("isotonic", "sigmoid"):
+            calibrator = fit_score_calibrator(
+                y_tr, s_tr, method=method, sample_weight=sw_tr
+            )
+            calibrated = calibrator.predict(s_te)
+            brier_scores[method].append(brier_score_loss(y_te, calibrated))
+
+    best_method, best_brier = "isotonic", float("inf")
+    for method, scores in brier_scores.items():
+        mean_brier = float(np.mean(scores))
+        if mean_brier < best_brier:
+            best_method, best_brier = method, mean_brier
+    return best_method, best_brier
 
 
 # Label-based metrics suitable for threshold tuning. Threshold-free metrics
