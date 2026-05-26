@@ -61,14 +61,14 @@ if __name__ == "__main__":
     # Load the feature DataFrames
     feature_files = {
         "ctd": "X_ctd.tsv",
-        "ctdc": "X_ctdc.tsv",
-        "ctdt": "X_ctdt.tsv",
-        "ctdd": "X_ctdd.tsv",
+        # "ctdc": "X_ctdc.tsv",
+        # "ctdt": "X_ctdt.tsv",
+        # "ctdd": "X_ctdd.tsv",
         # "aac": "X_aac.tsv",
         # "b2b": "X_b2btools.tsv",
         "nsp": "X_netsurfp.tsv",
         # "residue": "X_residue.tsv",
-        "biophys": "X_biophys.tsv",
+        # "biophys": "X_biophys.tsv",
         "class": "X_class.tsv",
     }
 
@@ -92,11 +92,11 @@ if __name__ == "__main__":
     # Split comma-separated values and remove duplicates
     proteins = [
         # "DNA replication protein",
-        "RNA-dependent RNA polymerase",
+        # "RNA-dependent RNA polymerase",
         # "DNA-RNA polymerase superfamily",
         # "Reverse transcriptase",
         # "Coat protein",
-        "Movement protein",
+        # "Movement protein",
         # "Transactivator-Viroplasmin protein",
         "RNA silencing suppressor",
         # "Vector transmission protein",
@@ -149,7 +149,7 @@ if __name__ == "__main__":
                 y=y,
                 outer_cv_groups=groups,
                 inner_cv_groups=groups,
-                scoring="FNFP Loss",
+                scoring="KS",
                 algorithm=["XGB"],
                 scaler="robust",
                 feature_selector="pvalue",
@@ -161,5 +161,5 @@ if __name__ == "__main__":
                 n_jobs=12,
                 # calibration="auto",
                 optimize_threshold=True,
-                pos_weight_factor=1.2,
+                pos_weight_factor=1.5,
             )
