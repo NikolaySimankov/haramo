@@ -66,9 +66,7 @@ def _balanced_sample_weight(y, pos_weight_factor: float = 1.0) -> pd.Series:
     push the model to weight false negatives more heavily; lower values
     relax the balanced correction toward the natural class prior.
     """
-    sw = pd.Series(
-        compute_sample_weight(class_weight="balanced", y=y), index=y.index
-    )
+    sw = pd.Series(compute_sample_weight(class_weight="balanced", y=y), index=y.index)
     if pos_weight_factor != 1.0:
         pos_mask = y == 1
         sw.loc[pos_mask] = sw.loc[pos_mask] * float(pos_weight_factor)
@@ -97,7 +95,7 @@ def _score_fold(
         reduced_index = reduce_dataset(
             X=X_train,
             y=y_train,
-            target_size=2000,
+            target_size=10000,
             stage2_shrink=1,
             class_weight="balanced",
             random_state=random_state,
@@ -437,7 +435,7 @@ def _train_fold(
         reduce_dataset(
             X=X_train_sel.iloc[tr],
             y=y_train.iloc[tr],
-            target_size=2000,
+            target_size=10000,
             stage2_shrink=1,
             class_weight="balanced",
             random_state=random_state,
@@ -785,12 +783,9 @@ def nested_crossval(
 
     Reduction sizes
     ---------------
-    Percentages run 10 % → 100 % in 10 % steps.  A percentage is included
-    only when ``int(pct × min_n_train) ≥ 2000``.  When the smallest training
-    fold has fewer than 2 000 rows, only 80 % and 90 % are tested (100 % is
-    always included).  Reduced indices are computed **once per (split, pct)**
-    and reused across all pipelines so reduction noise never confounds model
-    comparisons.
+    The pct sweep is performed in ``_train_fold`` on inner CV (see its
+    inner-OOF block); ``nested_crossval`` only evaluates at each fold's
+    chosen ``best_pct``.
 
     Parameters
     ----------
@@ -935,9 +930,7 @@ def nested_crossval(
         tts_si = _tts_split_idx(fk)
         _reduce_for(tts_splits[tts_si][0], pct, tts_si, tts_reduced)
 
-    cfc_tasks = [
-        (fk, cfc_si) for fk in pipelines for cfc_si in range(n_cfc_splits)
-    ]
+    cfc_tasks = [(fk, cfc_si) for fk in pipelines for cfc_si in range(n_cfc_splits)]
     tts_tasks = [(fk, _tts_split_idx(fk)) for fk in pipelines]
 
     cfc_delayed = [
@@ -982,8 +975,7 @@ def nested_crossval(
     for fk in pipelines:
         pct = best_pct_per_fold[fk]
         print(
-            f"[nested_crossval] {fk}: refitting on full data at "
-            f"{int(pct * 100)}%"
+            f"[nested_crossval] {fk}: refitting on full data at " f"{int(pct * 100)}%"
         )
         best_pipelines[fk] = _refit_pipeline(
             pipelines[fk],
@@ -995,7 +987,8 @@ def nested_crossval(
             max_svm_samples=max_svm_samples,
         )
         cfc_oof = pd.concat(
-            [pred_store_cfc[(fk, si)] for si in range(n_cfc_splits)], axis=0,
+            [pred_store_cfc[(fk, si)] for si in range(n_cfc_splits)],
+            axis=0,
         )
         best_predictions[fk] = {
             "inner": inner_oof[fk][pct],
@@ -1023,17 +1016,13 @@ def nested_crossval(
             tts_oof["predicted"],
             y_score=tts_oof["score"] if "score" in tts_oof.columns else None,
         )
-        combined = pd.concat(
-            [cfc_rep.add_suffix(" CFC"), tts_rep.add_suffix(" TTS")]
-        )
+        combined = pd.concat([cfc_rep.add_suffix(" CFC"), tts_rep.add_suffix(" TTS")])
         validation_rows.append(combined)
         validation_index.append((fk, pct))
 
     validation = pd.DataFrame(
         validation_rows,
-        index=pd.MultiIndex.from_tuples(
-            validation_index, names=["fold", "reduction"]
-        ),
+        index=pd.MultiIndex.from_tuples(validation_index, names=["fold", "reduction"]),
     )
 
     return validation, best_pipelines, best_predictions, reduction_validation
@@ -1227,9 +1216,7 @@ def magic_now(
             calibrated_threshold = 0.5
             if optimize_threshold:
                 calibrated_threshold, threshold_score, used_metric = (
-                    find_best_threshold(
-                        inner_true, inner_score_cal, metric=scoring
-                    )
+                    find_best_threshold(inner_true, inner_score_cal, metric=scoring)
                 )
                 print(
                     f"[magic_now] {fold_key}: threshold={calibrated_threshold:.3f} "
@@ -1242,31 +1229,33 @@ def magic_now(
             variant_specs = [
                 (
                     "raw model",
-                    cfc_pred_raw, cfc_score_raw,
-                    tts_pred_raw, tts_score_raw,
+                    cfc_pred_raw,
+                    cfc_score_raw,
+                    tts_pred_raw,
+                    tts_score_raw,
                 ),
                 (
                     "calibrated model",
-                    cfc_pred_cal_05, cfc_score_cal,
-                    tts_pred_cal_05, tts_score_cal,
+                    cfc_pred_cal_05,
+                    cfc_score_cal,
+                    tts_pred_cal_05,
+                    tts_score_cal,
                 ),
             ]
             if optimize_threshold:
                 variant_specs.append(
                     (
                         "calibrated model with threshold",
-                        cfc_pred_cal_thr, cfc_score_cal,
-                        tts_pred_cal_thr, tts_score_cal,
+                        cfc_pred_cal_thr,
+                        cfc_score_cal,
+                        tts_pred_cal_thr,
+                        tts_score_cal,
                     )
                 )
 
             for label, c_pred, c_score, t_pred, t_score in variant_specs:
-                cfc_report = classification_report(
-                    cfc_true, c_pred, y_score=c_score
-                )
-                tts_report = classification_report(
-                    tts_true, t_pred, y_score=t_score
-                )
+                cfc_report = classification_report(cfc_true, c_pred, y_score=c_score)
+                tts_report = classification_report(tts_true, t_pred, y_score=t_score)
                 combined = pd.concat(
                     [cfc_report.add_suffix(" CFC"), tts_report.add_suffix(" TTS")]
                 )
@@ -1311,12 +1300,8 @@ def magic_now(
     # ---------------------------------------------------------------------#
     if plots:
         cfc_only = {fk: oof["cfc"] for fk, oof in predictions_by_fold.items()}
-        plot_pr_curve(
-            cfc_only, plots_dir / f"pr_curve{tag}.pdf", title="PR curve"
-        )
-        plot_roc_curve(
-            cfc_only, plots_dir / f"roc_curve{tag}.pdf", title="ROC curve"
-        )
+        plot_pr_curve(cfc_only, plots_dir / f"pr_curve{tag}.pdf", title="PR curve")
+        plot_roc_curve(cfc_only, plots_dir / f"roc_curve{tag}.pdf", title="ROC curve")
         plot_ks_statistic(
             cfc_only,
             plots_dir / f"ks_statistic{tag}.pdf",
@@ -1325,7 +1310,11 @@ def magic_now(
 
         for fold_key, uncal_pipe in uncalibrated_pipeline.items():
             variants = compute_calibration_variants(
-                uncal_pipe, X, y, sample_weight, random_state=random_state,
+                uncal_pipe,
+                X,
+                y,
+                sample_weight,
+                random_state=random_state,
             )
             plot_calibration_curve(
                 variants,
