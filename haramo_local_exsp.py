@@ -149,7 +149,7 @@ if __name__ == "__main__":
                 y=y,
                 outer_cv_groups=groups,
                 inner_cv_groups=groups,
-                scoring="KS",
+                scoring="FNFP Loss",
                 algorithm=["XGB"],
                 scaler="robust",
                 feature_selector="pvalue",

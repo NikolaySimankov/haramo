@@ -867,6 +867,7 @@ def nested_crossval(
     pipelines: dict,
     scoring: Union[str, Callable] = "MCC",
     random_state: int = 42,
+    cfc_random_state: int = 2024,
     outer_cv_groups: Union[np.ndarray, pd.Series, list] = None,
     n_jobs: int = 16,
     algorithms: Union[list, None] = None,
@@ -894,14 +895,23 @@ def nested_crossval(
         Mapping key → fitted Pipeline.  Single-algorithm mode: keys are
         ``"fold_{i}"``; per-algorithm mode: ``"fold_{i}_{alg}"``.
     scoring : str or callable, default ``"MCC"``
-        Metric used both for early stopping during the reduction-pct sweep
-        and for picking the winning ``(fold, pct)`` per algorithm. Should
-        match the metric the HPO optimised. Recognised string aliases:
-        ``"MCC"``, ``"PR AUC"``, ``"ROC AUC"``, ``"KS"``, plus common
-        sklearn names (``"balanced_accuracy"``, ``"f1"``, ...).
+        Metric used for early stopping during the reduction-pct sweep and
+        for picking the winning ``(fold, pct)`` per algorithm. Selection
+        runs on the **CFC** column (``"<metric> CFC"``); the TTS column is
+        reported alongside for diagnostic comparison. Should match the
+        metric the HPO optimised. Recognised string aliases: ``"MCC"``,
+        ``"PR AUC"``, ``"ROC AUC"``, ``"KS"``, plus common sklearn names
+        (``"balanced_accuracy"``, ``"f1"``, ...).
     random_state : int, default 42
+        Drives the TTS splits, which match train()'s outer CV grid.
+    cfc_random_state : int, default 2024
+        Independent fixed seed for the CFC evaluation grid. Differs from
+        ``random_state`` so the cross-fold competition is computed on a
+        shared, neutral grid (not the same one each fold_key was trained
+        against).
     outer_cv_groups : array-like, optional
-        Group labels for the outer StratifiedGroupKFold.
+        Group labels for the outer StratifiedGroupKFold (used by both
+        TTS and CFC grids).
     n_jobs : int, default 16
     algorithms : list of str, optional
         Per-algorithm mode: one best ``(fold, pct)`` is chosen per algorithm
@@ -913,7 +923,11 @@ def nested_crossval(
     Returns
     -------
     validation : pd.DataFrame
-        Classification report with MultiIndex as described above.
+        Classification report with MultiIndex as described above. Every
+        metric column appears twice, suffixed ``" CFC"`` (cross-fold
+        competition, concatenated across the cfc_splits grid) and
+        ``" TTS"`` (true test set, the fold_key's original held-out
+        outer-fold split).
     best_pipeline : Pipeline or list of Pipeline
         Single best pipeline or one per algorithm (per-algorithm mode).
     best_predictions : dict or list of dict
@@ -928,8 +942,14 @@ def nested_crossval(
 
     # The early-stopping criterion and the final (fold, pct) ranking use
     # the same metric the HPO optimised. Falls back to MCC for callable
-    # scorers or unrecognised strings.
+    # scorers or unrecognised strings. Each metric is computed twice in
+    # the validation report: once on CFC (cross-fold competition; every
+    # fold_key evaluated on a shared, separately-seeded 4-fold grid) and
+    # once on TTS (true test set; each fold_key evaluated on the exact
+    # outer-fold split it was held out from during train()).
     metric_col = scoring_to_metric_column(scoring, default="MCC")
+    cfc_metric_col = f"{metric_col} CFC"
+    tts_metric_col = f"{metric_col} TTS"
     lower_better = metric_is_lower_better(metric_col)
     _is_better = (
         (lambda new, cur: new <= cur) if lower_better else (lambda new, cur: new >= cur)
@@ -937,24 +957,45 @@ def nested_crossval(
     _idxbest = (lambda s: s.idxmin()) if lower_better else (lambda s: s.idxmax())
     _worst_init = float("inf") if lower_better else float("-inf")
 
+    # TTS splits — identical to train()'s outer CV. fold_key "fold_{i}"
+    # was originally held out from tts_splits[i-1][1].
     if outer_cv_groups is not None:
-        strat_kfold_outer = StratifiedGroupKFold(n_splits=4)
+        tts_kf = StratifiedGroupKFold(n_splits=4)
     else:
-        strat_kfold_outer = StratifiedKFold(
+        tts_kf = StratifiedKFold(
             n_splits=4,
             shuffle=True,
             random_state=random_state,
         )
+    tts_splits = list(tts_kf.split(X, y.astype("str"), groups=outer_cv_groups))
 
-    splits = list(strat_kfold_outer.split(X, y.astype("str"), groups=outer_cv_groups))
-    n_splits = len(splits)
+    # CFC splits — separate fixed seed so the evaluation grid is independent
+    # of train()'s outer CV; all fold_key models compete on the same grid.
+    if outer_cv_groups is not None:
+        cfc_kf = StratifiedGroupKFold(
+            n_splits=4, shuffle=True, random_state=cfc_random_state
+        )
+    else:
+        cfc_kf = StratifiedKFold(
+            n_splits=4, shuffle=True, random_state=cfc_random_state
+        )
+    cfc_splits = list(cfc_kf.split(X, y.astype("str"), groups=outer_cv_groups))
+    n_cfc_splits = len(cfc_splits)
+
+    def _tts_split_idx(fold_key):
+        """Recover the 0-indexed outer-fold position from a fold_key
+        like ``"fold_3"`` or ``"fold_3_LGBM"``."""
+        return int(fold_key.split("_")[1]) - 1
 
     # ------------------------------------------------------------------ #
     # Valid reduction percentages                                        #
     # ------------------------------------------------------------------ #
     all_percentages = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
     min_size = 2000
-    min_n_train = min(len(train_idx) for train_idx, _ in splits)
+    min_n_train = min(
+        min(len(train_idx) for train_idx, _ in cfc_splits),
+        min(len(train_idx) for train_idx, _ in tts_splits),
+    )
 
     if min_n_train < min_size:
         valid_pcts = [0.8, 0.9, 1.0]
@@ -1003,9 +1044,29 @@ def nested_crossval(
     best_score_es: dict = {fk: _worst_init for fk in pipelines}
     flagged_es: dict = {fk: False for fk in pipelines}
     active_es: dict = {fk: True for fk in pipelines}
-    reduced_idx: dict = {}
-    pred_store: dict = {}
+    cfc_reduced_idx: dict = {}
+    tts_reduced_idx: dict = {}
+    pred_store_cfc: dict = {}
+    pred_store_tts: dict = {}
     reports: dict = {}
+
+    def _reduce_for(train_index, pct, key, store):
+        if (key, pct) in store:
+            return
+        X_train = X.iloc[train_index]
+        y_train = y.iloc[train_index]
+        if pct == 1.0:
+            store[(key, pct)] = X_train.index
+        else:
+            store[(key, pct)] = reduce_dataset(
+                X=X_train,
+                y=y_train,
+                target_size=int(pct * len(train_index)),
+                stage2_shrink=1,
+                class_weight="balanced",
+                random_state=random_state,
+                verbose=False,
+            )
 
     for pct in loop_pcts:
         active_keys = [
@@ -1016,58 +1077,82 @@ def nested_crossval(
                 break  # every fold_key has been early-stopped
             continue  # some fold_keys still active but not at this pct
 
-        # Lazy-compute reduced indices for this pct only
-        for split_idx, (train_index, _) in enumerate(splits):
-            if (split_idx, pct) not in reduced_idx:
-                X_train = X.iloc[train_index]
-                y_train = y.iloc[train_index]
-                n_train = len(train_index)
-                if pct == 1.0:
-                    reduced_idx[(split_idx, pct)] = X_train.index
-                else:
-                    reduced_idx[(split_idx, pct)] = reduce_dataset(
-                        X=X_train,
-                        y=y_train,
-                        target_size=int(pct * n_train),
-                        stage2_shrink=1,
-                        class_weight="balanced",
-                        random_state=random_state,
-                        verbose=False,
-                    )
+        # Lazy-compute reduced indices for this pct on both grids.
+        for cfc_si, (train_index, _) in enumerate(cfc_splits):
+            _reduce_for(train_index, pct, cfc_si, cfc_reduced_idx)
 
-        # Parallel over active fold_keys × all splits
-        task_keys_pct = [
-            (fold_key, split_idx)
-            for fold_key in active_keys
-            for split_idx in range(n_splits)
+        # TTS only needs the splits that match an active fold_key.
+        needed_tts_indices = {_tts_split_idx(fk) for fk in active_keys}
+        for tts_si in needed_tts_indices:
+            _reduce_for(tts_splits[tts_si][0], pct, tts_si, tts_reduced_idx)
+
+        # Build one parallel batch for both CFC and TTS fits.
+        cfc_tasks = [
+            (fk, cfc_si)
+            for fk in active_keys
+            for cfc_si in range(n_cfc_splits)
         ]
-        results_pct = Parallel(n_jobs=n_jobs)(
+        tts_tasks = [(fk, _tts_split_idx(fk)) for fk in active_keys]
+
+        cfc_delayed = [
             delayed(_fit_and_predict)(
-                pipelines[fold_key],
+                pipelines[fk],
                 X,
                 y,
                 sample_weight,
-                splits[split_idx][0],
-                splits[split_idx][1],
-                reduced_idx[(split_idx, pct)],
+                cfc_splits[cfc_si][0],
+                cfc_splits[cfc_si][1],
+                cfc_reduced_idx[(cfc_si, pct)],
             )
-            for fold_key, split_idx in task_keys_pct
-        )
-        for (fold_key, split_idx), df in zip(task_keys_pct, results_pct):
-            pred_store[(fold_key, split_idx, pct)] = df
+            for fk, cfc_si in cfc_tasks
+        ]
+        tts_delayed = [
+            delayed(_fit_and_predict)(
+                pipelines[fk],
+                X,
+                y,
+                sample_weight,
+                tts_splits[tts_si][0],
+                tts_splits[tts_si][1],
+                tts_reduced_idx[(tts_si, pct)],
+            )
+            for fk, tts_si in tts_tasks
+        ]
 
-        # Aggregate and apply early-stopping logic per fold_key
+        results = Parallel(n_jobs=n_jobs)(cfc_delayed + tts_delayed)
+        n_cfc = len(cfc_tasks)
+        for (fk, cfc_si), df in zip(cfc_tasks, results[:n_cfc]):
+            pred_store_cfc[(fk, cfc_si, pct)] = df
+        for (fk, tts_si), df in zip(tts_tasks, results[n_cfc:]):
+            pred_store_tts[(fk, pct)] = df
+
+        # Aggregate per fold_key; build a combined CFC + TTS report.
         for fold_key in active_keys:
-            all_preds = pd.concat(
-                [pred_store[(fold_key, si, pct)] for si in range(n_splits)], axis=0
+            cfc_preds = pd.concat(
+                [pred_store_cfc[(fold_key, si, pct)] for si in range(n_cfc_splits)],
+                axis=0,
             )
-            report = classification_report(
-                all_preds["true"],
-                all_preds["predicted"],
-                y_score=all_preds["score"] if "score" in all_preds.columns else None,
+            cfc_report = classification_report(
+                cfc_preds["true"],
+                cfc_preds["predicted"],
+                y_score=cfc_preds["score"] if "score" in cfc_preds.columns else None,
             )
-            reports[(fold_key, pct)] = report
-            score_val = report[metric_col]
+
+            tts_preds = pred_store_tts[(fold_key, pct)]
+            tts_report = classification_report(
+                tts_preds["true"],
+                tts_preds["predicted"],
+                y_score=tts_preds["score"] if "score" in tts_preds.columns else None,
+            )
+
+            # Suffix and concatenate so each metric appears twice in the row.
+            combined = pd.concat(
+                [cfc_report.add_suffix(" CFC"), tts_report.add_suffix(" TTS")]
+            )
+            reports[(fold_key, pct)] = combined
+
+            # Early stopping uses CFC (more data, lower variance).
+            score_val = combined[cfc_metric_col]
 
             cmp = "<" if not lower_better else ">"
             if not flagged_es[fold_key]:
@@ -1077,7 +1162,7 @@ def nested_crossval(
                     flagged_es[fold_key] = True
                     print(
                         f"[nested_crossval] {fold_key!r} dip at {int(pct * 100)}%"
-                        f" ({metric_col}={score_val:.4f} {cmp} best={best_score_es[fold_key]:.4f})"
+                        f" ({cfc_metric_col}={score_val:.4f} {cmp} best={best_score_es[fold_key]:.4f})"
                         " — giving one more chance …"
                     )
             else:
@@ -1089,7 +1174,7 @@ def nested_crossval(
                     flagged_es[fold_key] = False
                     print(
                         f"[nested_crossval] Early stop {fold_key!r} at {int(pct * 100)}%"
-                        f" ({metric_col}={score_val:.4f} {cmp} best={best_score_es[fold_key]:.4f})"
+                        f" ({cfc_metric_col}={score_val:.4f} {cmp} best={best_score_es[fold_key]:.4f})"
                     )
 
     # ------------------------------------------------------------------ #
@@ -1114,11 +1199,11 @@ def nested_crossval(
         best_predictions = []
         for alg in algorithms:
             alg_df = validation.loc[alg]
-            best_fold_key, best_pct = _idxbest(alg_df[metric_col])
-            best_score = alg_df.loc[(best_fold_key, best_pct), metric_col]
+            best_fold_key, best_pct = _idxbest(alg_df[cfc_metric_col])
+            best_score = alg_df.loc[(best_fold_key, best_pct), cfc_metric_col]
             print(
                 f"[nested_crossval] {alg}: best fold={best_fold_key!r} "
-                f"@ {int(best_pct * 100)}% ({metric_col}={best_score:.4f}) "
+                f"@ {int(best_pct * 100)}% ({cfc_metric_col}={best_score:.4f}) "
                 f"— refitting …"
             )
             best_pipelines.append(
@@ -1133,12 +1218,12 @@ def nested_crossval(
                 )
             )
             # Surface every competing outer-fold model for this algorithm at
-            # its own best pct, concatenated across the n_splits test folds.
+            # its own best pct, CFC-concatenated across the eval grid.
             alg_predictions = {}
             for fk in alg_df.index.get_level_values("fold").unique():
-                fk_best_pct = _idxbest(alg_df.loc[fk, metric_col])
+                fk_best_pct = _idxbest(alg_df.loc[fk, cfc_metric_col])
                 alg_predictions[fk] = pd.concat(
-                    [pred_store[(fk, si, fk_best_pct)] for si in range(n_splits)],
+                    [pred_store_cfc[(fk, si, fk_best_pct)] for si in range(n_cfc_splits)],
                     axis=0,
                 )
             best_predictions.append(alg_predictions)
@@ -1154,11 +1239,11 @@ def nested_crossval(
         index=pd.MultiIndex.from_tuples(index_tuples, names=["fold", "reduction"]),
     )
 
-    best_fold, best_pct = _idxbest(validation[metric_col])
-    best_score = validation.loc[(best_fold, best_pct), metric_col]
+    best_fold, best_pct = _idxbest(validation[cfc_metric_col])
+    best_score = validation.loc[(best_fold, best_pct), cfc_metric_col]
     print(
         f"[nested_crossval] Best: {best_fold!r} @ {int(best_pct * 100)}% "
-        f"({metric_col}={best_score:.4f}) — refitting …"
+        f"({cfc_metric_col}={best_score:.4f}) — refitting …"
     )
     best_model = _refit_pipeline(
         pipelines[best_fold],
@@ -1171,12 +1256,12 @@ def nested_crossval(
     )
 
     # Surface every competing outer-fold model at its own best pct,
-    # concatenated across the n_splits test folds.
+    # CFC-concatenated across the eval grid.
     best_predictions = {}
     for fk in validation.index.get_level_values("fold").unique():
-        fk_best_pct = _idxbest(validation.loc[fk, metric_col])
+        fk_best_pct = _idxbest(validation.loc[fk, cfc_metric_col])
         best_predictions[fk] = pd.concat(
-            [pred_store[(fk, si, fk_best_pct)] for si in range(n_splits)],
+            [pred_store_cfc[(fk, si, fk_best_pct)] for si in range(n_cfc_splits)],
             axis=0,
         )
 
@@ -1203,6 +1288,7 @@ def magic_now(
     calibration: Union[str, None] = None,
     optimize_threshold: bool = False,
     pos_weight_factor: float = 1.0,
+    cfc_random_state: int = 2024,
 ):
 
     if not output_dir:
@@ -1288,6 +1374,7 @@ def magic_now(
         n_jobs=n_jobs,
         algorithms=algorithm if per_alg_mode else None,
         pos_weight_factor=pos_weight_factor,
+        cfc_random_state=cfc_random_state,
     )
 
     # Keep a reference to the uncalibrated pipeline(s) for the calibration
