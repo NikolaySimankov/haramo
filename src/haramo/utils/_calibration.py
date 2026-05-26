@@ -112,11 +112,19 @@ def pick_best_calibration_method(
 # Label-based metrics suitable for threshold tuning. Threshold-free metrics
 # (PR AUC, ROC AUC, KS, Brier) are NOT in this map — passing them falls
 # back to MCC with a printed note.
+def _fn_fp_loss_label(y_true, y_pred):
+    """Lazy wrapper so :data:`_THRESHOLD_METRIC_FNS` can reference ``fn_fp_loss``
+    without a top-level circular import from ``_evaluation``."""
+    from ._evaluation import fn_fp_loss
+    return fn_fp_loss(y_true, y_pred)
+
+
 _THRESHOLD_METRIC_FNS = {
     "MCC": matthews_corrcoef,
     "F1-score": f1_score,
     "Bal. Acc.": balanced_accuracy_score,
     "Kappa": cohen_kappa_score,
+    "FNFP Loss": _fn_fp_loss_label,
 }
 
 
@@ -124,10 +132,12 @@ def find_best_threshold(y_true, y_score, metric="MCC", n_thresholds=101):
     """Scan thresholds in ``[0, 1]``; return ``(best_threshold, best_value)``.
 
     ``metric`` is any identifier accepted by ``scoring_to_metric_column``.
-    Threshold-free metrics (PR AUC, ROC AUC, KS, Brier) silently fall back
-    to MCC.
+    For higher-is-better metrics (MCC, F1, ...) the threshold maximising the
+    metric is returned; for lower-is-better losses (FNFP Loss) the minimising
+    threshold is returned. Threshold-free metrics (PR AUC, ROC AUC, KS, Brier)
+    silently fall back to MCC.
     """
-    from ._evaluation import scoring_to_metric_column
+    from ._evaluation import scoring_to_metric_column, metric_is_lower_better
 
     metric_col = scoring_to_metric_column(metric, default="MCC")
     if metric_col not in _THRESHOLD_METRIC_FNS:
@@ -137,12 +147,13 @@ def find_best_threshold(y_true, y_score, metric="MCC", n_thresholds=101):
         )
         metric_col = "MCC"
     fn = _THRESHOLD_METRIC_FNS[metric_col]
+    lower_better = metric_is_lower_better(metric_col)
 
     y_true = np.asarray(y_true).astype(int)
     y_score = np.asarray(y_score, dtype=float)
     thresholds = np.linspace(0.0, 1.0, n_thresholds)
     scores = np.array([fn(y_true, (y_score >= t).astype(int)) for t in thresholds])
-    best_idx = int(np.argmax(scores))
+    best_idx = int(np.argmin(scores) if lower_better else np.argmax(scores))
     return float(thresholds[best_idx]), float(scores[best_idx])
 
 

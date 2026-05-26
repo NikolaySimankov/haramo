@@ -221,12 +221,36 @@ brier_scorer = make_scorer(
 )
 
 
+def fn_fp_loss(y_true, y_pred, fp_weight=1.5):
+    """Asymmetric label-based loss: ``(1 - sens)^2 + fp_weight * (1 - sel)^2``.
+
+    ``sens`` (sensitivity / true-positive rate) and ``sel`` (selectivity /
+    true-negative rate) are recall scores on the positive and negative class
+    respectively. Both error terms are squared so larger gaps are penalised
+    super-linearly; ``fp_weight`` (default 1.5) makes false positives more
+    costly than false negatives. Lower is better.
+    """
+    y_true = np.asarray(y_true).astype(int)
+    y_pred = np.asarray(y_pred).astype(int)
+    sens = recall_score(y_true, y_pred, average="binary", zero_division=0)
+    sel = recall_score(
+        y_true, y_pred, pos_label=0, average="binary", zero_division=0
+    )
+    return float((1.0 - sens) ** 2 + fp_weight * (1.0 - sel) ** 2)
+
+
+# Label-based, so no response_method needed. greater_is_better=False so
+# Optuna minimises it via internal sign flip.
+fn_fp_loss_scorer = make_scorer(fn_fp_loss, greater_is_better=False)
+
+
 _INTERNAL_SCORERS = {
     "MCC": mcc_scorer,
     "PR AUC": pr_auc_scorer,
     "ROC AUC": roc_auc_scorer,
     "KS": ks_scorer,
     "Brier": brier_scorer,
+    "FNFP Loss": fn_fp_loss_scorer,
 }
 
 
@@ -253,6 +277,7 @@ _SCORING_TO_COLUMN = {
     "ROC AUC": "ROC AUC",
     "KS": "KS",
     "Brier": "Brier",
+    "FNFP Loss": "FNFP Loss",
     "balanced_accuracy": "Bal. Acc.",
     "f1": "F1-score",
     "precision": "Precision",
@@ -264,8 +289,8 @@ _SCORING_TO_COLUMN = {
 
 # Columns in classification_report where lower values are better. Used by
 # the ranking/early-stopping logic in nested_crossval so that loss-style
-# metrics (Brier) pick the minimum rather than the maximum.
-_LOWER_IS_BETTER_COLUMNS = {"Brier"}
+# metrics (Brier, FNFP Loss) pick the minimum rather than the maximum.
+_LOWER_IS_BETTER_COLUMNS = {"Brier", "FNFP Loss"}
 
 
 def scoring_to_metric_column(scoring, default="MCC"):
@@ -336,6 +361,11 @@ def classification_report(true_value, predicted_value, y_score=None):
         pos_label=0,
         average="binary",
     )
+
+    table["FNFP Loss"] = fn_fp_loss(
+        true_value,
+        predicted_value,
+        )
 
     if y_score is not None and not pd.isna(np.asarray(y_score, dtype=float)).all():
         table["PR AUC"] = average_precision_score(true_value, y_score)

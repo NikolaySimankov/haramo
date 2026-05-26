@@ -150,7 +150,7 @@ if __name__ == "__main__":
                 outer_cv_groups=groups,
                 inner_cv_groups=groups,
                 scoring="KS",
-                algorithm=["LGBM", "XGB", "CatB"],
+                algorithm=["XGB"],
                 scaler="robust",
                 feature_selector="pvalue",
                 hyperparameters="default",
@@ -160,5 +160,5 @@ if __name__ == "__main__":
                 tag=f"_{protein}_{target}",
                 n_jobs=12,
                 calibration="auto",
-                optimize_threshold=False,
+                optimize_threshold=True,
             )
