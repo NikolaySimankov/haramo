@@ -1,4 +1,4 @@
-__version__ = "0.5.0"
+__version__ = "0.17.0"
 
 from . import _optuna_patch  # noqa: F401 — installs trial.suggest_power
 
