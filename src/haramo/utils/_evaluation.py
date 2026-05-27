@@ -12,6 +12,8 @@ from scipy.stats import (
     spearmanr,
 )
 
+from sklearn.calibration import calibration_curve
+
 from sklearn.metrics import (
     balanced_accuracy_score,
     f1_score,

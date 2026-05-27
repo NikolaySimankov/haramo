@@ -507,7 +507,7 @@ def _train_fold(
         _inner_pcts = [
             p for p in _all_percentages if int(p * _min_inner_train) >= _MIN_TRAIN
         ]
-    # Universal max-train cap (applies to every algorithm, not just SVMs).
+    # Universal max-train cap (applies to every algorithm).
     _inner_pcts = [p for p in _inner_pcts if int(p * _min_inner_train) <= _MAX_TRAIN]
     if not _inner_pcts:
         _inner_pcts = [round(_MAX_TRAIN / _min_inner_train, 4)]
