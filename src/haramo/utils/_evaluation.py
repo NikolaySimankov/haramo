@@ -235,9 +235,7 @@ def fn_fp_loss(y_true, y_pred, fp_weight=1.5):
     y_true = np.asarray(y_true).astype(int)
     y_pred = np.asarray(y_pred).astype(int)
     sens = recall_score(y_true, y_pred, average="binary", zero_division=0)
-    sel = recall_score(
-        y_true, y_pred, pos_label=0, average="binary", zero_division=0
-    )
+    sel = recall_score(y_true, y_pred, pos_label=0, average="binary", zero_division=0)
     return float((1.0 - sens) ** 2 + fp_weight * (1.0 - sel) ** 2)
 
 
@@ -248,18 +246,18 @@ fn_fp_loss_scorer = make_scorer(fn_fp_loss, greater_is_better=False)
 
 _INTERNAL_SCORERS = {
     "MCC": mcc_scorer,
-    "PR AUC": pr_auc_scorer,
-    "ROC AUC": roc_auc_scorer,
+    "PRAUC": pr_auc_scorer,
+    "ROCAUC": roc_auc_scorer,
     "KS": ks_scorer,
     "Brier": brier_scorer,
-    "FNFP Loss": fn_fp_loss_scorer,
+    "FNFP": fn_fp_loss_scorer,
 }
 
 
 def resolve_scorer(scoring):
     """Resolve a scoring argument to a sklearn-compatible scorer callable.
 
-    Accepts an internal alias ("MCC", "PR AUC", "ROC AUC"), any
+    Accepts an internal alias ("MCC", "PRAUC", "ROCAUC"), any
     string supported by sklearn's ``get_scorer``, or a callable
     (returned as-is).
     """
@@ -279,9 +277,9 @@ _SCORING_TO_COLUMN = {
     "ROC AUC": "ROC AUC",
     "KS": "KS",
     "Brier": "Brier",
-    "FNFP Loss": "FNFP Loss",
+    "FNFP": "FNFP loss",
     "balanced_accuracy": "Bal. Acc.",
-    "f1": "F1-score",
+    "f1": "F1 score",
     "precision": "Precision",
     "recall": "Sensitivity",
     "average_precision": "PR AUC",
@@ -292,7 +290,7 @@ _SCORING_TO_COLUMN = {
 # Columns in classification_report where lower values are better. Used by
 # the ranking/early-stopping logic in nested_crossval so that loss-style
 # metrics (Brier, FNFP Loss) pick the minimum rather than the maximum.
-_LOWER_IS_BETTER_COLUMNS = {"Brier", "FNFP Loss"}
+_LOWER_IS_BETTER_COLUMNS = {"Brier", "FNFP loss"}
 
 
 def scoring_to_metric_column(scoring, default="MCC"):
@@ -330,7 +328,7 @@ def classification_report(true_value, predicted_value, y_score=None):
         predicted_value,
     )
 
-    table["F1-score"] = f1_score(
+    table["F1 score"] = f1_score(
         true_value,
         predicted_value,
     )
@@ -364,10 +362,10 @@ def classification_report(true_value, predicted_value, y_score=None):
         average="binary",
     )
 
-    table["FNFP Loss"] = fn_fp_loss(
+    table["FNFP loss"] = fn_fp_loss(
         true_value,
         predicted_value,
-        )
+    )
 
     if y_score is not None and not pd.isna(np.asarray(y_score, dtype=float)).all():
         table["PR AUC"] = average_precision_score(true_value, y_score)
@@ -500,20 +498,28 @@ def plot_pr_curve(predictions_by_model, output_path, title=None, mark_cutoff=0.5
         # precision_recall_curve returns recall decreasing; flip for np.interp
         per_model.append((recall[::-1], precision[::-1]))
         ax.plot(
-            recall, precision, alpha=0.4, lw=1,
+            recall,
+            precision,
+            alpha=0.4,
+            lw=1,
             label=f"{model_key} (AP={ap:.2f})",
         )
 
     mean_p, std_p = _aggregate_curves(per_model, recall_grid)
     ax.plot(
-        recall_grid, mean_p, color="b", lw=2,
-        label=fr"Mean PR (AP = {np.mean(aps):.2f} $\pm$ {np.std(aps):.2f})",
+        recall_grid,
+        mean_p,
+        color="b",
+        lw=2,
+        label=rf"Mean PR (AP = {np.mean(aps):.2f} $\pm$ {np.std(aps):.2f})",
     )
     ax.fill_between(
         recall_grid,
         np.clip(mean_p - std_p, 0, 1),
         np.clip(mean_p + std_p, 0, 1),
-        color="grey", alpha=0.2, label=r"$\pm$ 1 std. dev.",
+        color="grey",
+        alpha=0.2,
+        label=r"$\pm$ 1 std. dev.",
     )
 
     if mark_cutoff is not None:
@@ -525,14 +531,19 @@ def plot_pr_curve(predictions_by_model, output_path, title=None, mark_cutoff=0.5
             rs.append(recall_score(y_true, y_pred_cut, zero_division=0))
             ps.append(precision_score(y_true, y_pred_cut, zero_division=0))
         ax.plot(
-            np.mean(rs), np.mean(ps), marker="o", markersize=10,
+            np.mean(rs),
+            np.mean(ps),
+            marker="o",
+            markersize=10,
             color="tab:blue",
             label=f"Default cut-off @ p={mark_cutoff}",
         )
 
     ax.set(
-        xlabel="Recall", ylabel="Precision",
-        xlim=(-0.01, 1.01), ylim=(-0.01, 1.01),
+        xlabel="Recall",
+        ylabel="Precision",
+        xlim=(-0.01, 1.01),
+        ylim=(-0.01, 1.01),
         title=title or "Precision-Recall curve (outer-fold models)",
     )
     ax.legend(loc="lower left", fontsize=8)
@@ -583,16 +594,36 @@ def plot_ks_statistic(predictions_by_model, output_path, title=None, n_deciles=1
     mean_pos, std_pos = pos_arr.mean(axis=0), pos_arr.std(axis=0)
     mean_neg, std_neg = neg_arr.mean(axis=0), neg_arr.std(axis=0)
 
-    ax.plot(deciles, mean_pos, marker="o", color="tab:green", lw=2,
-            label="Mean cum. positives")
-    ax.plot(deciles, mean_neg, marker="o", color="tab:red", lw=2,
-            label="Mean cum. negatives")
-    ax.fill_between(deciles, np.clip(mean_pos - std_pos, 0, 1),
-                    np.clip(mean_pos + std_pos, 0, 1),
-                    color="tab:green", alpha=0.15)
-    ax.fill_between(deciles, np.clip(mean_neg - std_neg, 0, 1),
-                    np.clip(mean_neg + std_neg, 0, 1),
-                    color="tab:red", alpha=0.15)
+    ax.plot(
+        deciles,
+        mean_pos,
+        marker="o",
+        color="tab:green",
+        lw=2,
+        label="Mean cum. positives",
+    )
+    ax.plot(
+        deciles,
+        mean_neg,
+        marker="o",
+        color="tab:red",
+        lw=2,
+        label="Mean cum. negatives",
+    )
+    ax.fill_between(
+        deciles,
+        np.clip(mean_pos - std_pos, 0, 1),
+        np.clip(mean_pos + std_pos, 0, 1),
+        color="tab:green",
+        alpha=0.15,
+    )
+    ax.fill_between(
+        deciles,
+        np.clip(mean_neg - std_neg, 0, 1),
+        np.clip(mean_neg + std_neg, 0, 1),
+        color="tab:red",
+        alpha=0.15,
+    )
 
     diffs = np.abs(mean_pos - mean_neg)
     ks_decile_mean = int(np.argmax(diffs))
@@ -601,13 +632,18 @@ def plot_ks_statistic(predictions_by_model, output_path, title=None, n_deciles=1
     ax.plot(
         [ks_decile_mean, ks_decile_mean],
         [mean_neg[ks_decile_mean], mean_pos[ks_decile_mean]],
-        linestyle="--", marker="o", color="tab:blue", lw=2,
-        label=fr"KS = {mean_ks:.3f} $\pm$ {std_ks:.3f} @ decile {ks_decile_mean}",
+        linestyle="--",
+        marker="o",
+        color="tab:blue",
+        lw=2,
+        label=rf"KS = {mean_ks:.3f} $\pm$ {std_ks:.3f} @ decile {ks_decile_mean}",
     )
 
     ax.set(
-        xlabel="Deciles", ylabel="Cumulative rate",
-        xlim=(0, n_deciles), ylim=(0, 1),
+        xlabel="Deciles",
+        ylabel="Cumulative rate",
+        xlim=(0, n_deciles),
+        ylim=(0, 1),
         title=title or "KS statistic (outer-fold models)",
     )
     ax.legend(loc="lower right", fontsize=8)
@@ -664,15 +700,19 @@ def plot_pr_curve_grouped(groups, output_path, title=None, mark_cutoff=0.5):
             continue
         mean_p, std_p = _aggregate_curves(per_fold, recall_grid)
         ax.plot(
-            recall_grid, mean_p,
-            color=color, linestyle=ls, lw=2,
-            label=fr"{label} (AP = {np.mean(aps):.2f} $\pm$ {np.std(aps):.2f})",
+            recall_grid,
+            mean_p,
+            color=color,
+            linestyle=ls,
+            lw=2,
+            label=rf"{label} (AP = {np.mean(aps):.2f} $\pm$ {np.std(aps):.2f})",
         )
         ax.fill_between(
             recall_grid,
             np.clip(mean_p - std_p, 0, 1),
             np.clip(mean_p + std_p, 0, 1),
-            color=color, alpha=0.12,
+            color=color,
+            alpha=0.12,
         )
         if mark_cutoff is not None:
             rs, ps = [], []
@@ -683,13 +723,19 @@ def plot_pr_curve_grouped(groups, output_path, title=None, mark_cutoff=0.5):
                 rs.append(recall_score(y_true, y_pred, zero_division=0))
                 ps.append(precision_score(y_true, y_pred, zero_division=0))
             ax.plot(
-                np.mean(rs), np.mean(ps),
-                marker="o", markersize=7, color=color, linestyle="None",
+                np.mean(rs),
+                np.mean(ps),
+                marker="o",
+                markersize=7,
+                color=color,
+                linestyle="None",
             )
 
     ax.set(
-        xlabel="Recall", ylabel="Precision",
-        xlim=(-0.01, 1.01), ylim=(-0.01, 1.01),
+        xlabel="Recall",
+        ylabel="Precision",
+        xlim=(-0.01, 1.01),
+        ylim=(-0.01, 1.01),
         title=title or "Precision-Recall (mean across folds)",
     )
     ax.legend(loc="lower left", fontsize=8)
@@ -722,23 +768,34 @@ def plot_roc_curve_grouped(groups, output_path, title=None):
         mean_tpr, std_tpr = _aggregate_curves(per_fold, fpr_grid)
         mean_tpr[0], mean_tpr[-1] = 0.0, 1.0
         ax.plot(
-            fpr_grid, mean_tpr,
-            color=color, linestyle=ls, lw=2,
-            label=fr"{label} (AUC = {np.mean(aucs):.2f} $\pm$ {np.std(aucs):.2f})",
+            fpr_grid,
+            mean_tpr,
+            color=color,
+            linestyle=ls,
+            lw=2,
+            label=rf"{label} (AUC = {np.mean(aucs):.2f} $\pm$ {np.std(aucs):.2f})",
         )
         ax.fill_between(
             fpr_grid,
             np.clip(mean_tpr - std_tpr, 0, 1),
             np.clip(mean_tpr + std_tpr, 0, 1),
-            color=color, alpha=0.12,
+            color=color,
+            alpha=0.12,
         )
 
     ax.plot(
-        [0, 1], [0, 1], linestyle=":", color="gray", alpha=0.6, label="Chance",
+        [0, 1],
+        [0, 1],
+        linestyle=":",
+        color="gray",
+        alpha=0.6,
+        label="Chance",
     )
     ax.set(
-        xlabel="False Positive Rate", ylabel="True Positive Rate",
-        xlim=(-0.01, 1.01), ylim=(-0.01, 1.01),
+        xlabel="False Positive Rate",
+        ylabel="True Positive Rate",
+        xlim=(-0.01, 1.01),
+        ylim=(-0.01, 1.01),
         title=title or "ROC (mean across folds)",
     )
     ax.legend(loc="lower right", fontsize=8)
@@ -786,21 +843,28 @@ def plot_calibration_curve_grouped(
         )
         brier = brier_score_loss(y_true, y_score)
         ax.plot(
-            prob_pred, prob_true,
-            marker="o", lw=1.8,
-            color=color, linestyle=ls,
+            prob_pred,
+            prob_true,
+            marker="o",
+            lw=1.8,
+            color=color,
+            linestyle=ls,
             label=f"{label} (Brier={brier:.3f})",
         )
 
     ax.plot(
-        [0, 1], [0, 1],
-        linestyle=":", color="gray", alpha=0.6,
+        [0, 1],
+        [0, 1],
+        linestyle=":",
+        color="gray",
+        alpha=0.6,
         label="Perfectly calibrated",
     )
     ax.set(
         xlabel="Mean predicted probability",
         ylabel="Fraction of positives",
-        xlim=(-0.01, 1.01), ylim=(-0.01, 1.01),
+        xlim=(-0.01, 1.01),
+        ylim=(-0.01, 1.01),
         title=title or "Reliability (pooled across folds, Brier in legend)",
     )
     ax.legend(loc="lower right", fontsize=8)
@@ -838,20 +902,27 @@ def plot_ks_statistic_grouped(groups, output_path, title=None, n_deciles=10):
         mean_gap = gap.mean(axis=0)
         std_gap = gap.std(axis=0)
         ax.plot(
-            deciles, mean_gap, marker="o",
-            color=color, linestyle=ls, lw=2,
-            label=fr"{label} (KS = {np.mean(ks_maxes):.3f} $\pm$ {np.std(ks_maxes):.3f})",
+            deciles,
+            mean_gap,
+            marker="o",
+            color=color,
+            linestyle=ls,
+            lw=2,
+            label=rf"{label} (KS = {np.mean(ks_maxes):.3f} $\pm$ {np.std(ks_maxes):.3f})",
         )
         ax.fill_between(
             deciles,
             np.clip(mean_gap - std_gap, 0, 1),
             np.clip(mean_gap + std_gap, 0, 1),
-            color=color, alpha=0.12,
+            color=color,
+            alpha=0.12,
         )
 
     ax.set(
-        xlabel="Decile", ylabel=r"$|\,$cum. positives $-$ cum. negatives$\,|$",
-        xlim=(0, n_deciles), ylim=(0, 1),
+        xlabel="Decile",
+        ylabel=r"$|\,$cum. positives $-$ cum. negatives$\,|$",
+        xlim=(0, n_deciles),
+        ylim=(0, 1),
         title=title or "KS gap (mean across folds)",
     )
     ax.legend(loc="lower right", fontsize=8)
@@ -885,29 +956,44 @@ def plot_roc_curve(predictions_by_model, output_path, title=None):
         aucs.append(roc_auc_val)
         per_model.append((fpr, tpr))
         ax.plot(
-            fpr, tpr, alpha=0.4, lw=1,
+            fpr,
+            tpr,
+            alpha=0.4,
+            lw=1,
             label=f"{model_key} (AUC={roc_auc_val:.2f})",
         )
 
     mean_tpr, std_tpr = _aggregate_curves(per_model, fpr_grid)
     mean_tpr[0], mean_tpr[-1] = 0.0, 1.0
     ax.plot(
-        fpr_grid, mean_tpr, color="b", lw=2,
-        label=fr"Mean ROC (AUC = {np.mean(aucs):.2f} $\pm$ {np.std(aucs):.2f})",
+        fpr_grid,
+        mean_tpr,
+        color="b",
+        lw=2,
+        label=rf"Mean ROC (AUC = {np.mean(aucs):.2f} $\pm$ {np.std(aucs):.2f})",
     )
     ax.fill_between(
         fpr_grid,
         np.clip(mean_tpr - std_tpr, 0, 1),
         np.clip(mean_tpr + std_tpr, 0, 1),
-        color="grey", alpha=0.2, label=r"$\pm$ 1 std. dev.",
+        color="grey",
+        alpha=0.2,
+        label=r"$\pm$ 1 std. dev.",
     )
     ax.plot(
-        [0, 1], [0, 1], linestyle="--", color="gray", alpha=0.5, label="Chance",
+        [0, 1],
+        [0, 1],
+        linestyle="--",
+        color="gray",
+        alpha=0.5,
+        label="Chance",
     )
 
     ax.set(
-        xlabel="False Positive Rate", ylabel="True Positive Rate",
-        xlim=(-0.01, 1.01), ylim=(-0.01, 1.01),
+        xlabel="False Positive Rate",
+        ylabel="True Positive Rate",
+        xlim=(-0.01, 1.01),
+        ylim=(-0.01, 1.01),
         title=title or "ROC curve (outer-fold models)",
     )
     ax.legend(loc="lower right", fontsize=8)

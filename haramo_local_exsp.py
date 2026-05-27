@@ -134,8 +134,8 @@ if __name__ == "__main__":
             prot_counts = targets.apply(lambda x: x.sum(), axis=0).sort_values(
                 ascending=False
             )
-            consistant_targets = prot_counts[prot_counts >= 100].index
-            # chose 2 random consistant targets for each protein
+            consistent_targets = prot_counts[prot_counts >= 100].index
+            # chose 2 random consistent targets for each protein
 
             target = "Gomphrena globosa"
             # for target in consistant_targets:
@@ -149,17 +149,17 @@ if __name__ == "__main__":
                 y=y,
                 outer_cv_groups=groups,
                 inner_cv_groups=groups,
-                scoring="FNFP Loss",
-                algorithm=["LGBM"],
+                scoring="FNFP",
+                algorithm=["CatB"],
                 scaler="robust",
                 feature_selector="pvalue",
                 hyperparameters="optimize",
-                n_trials=40,
+                n_trials=10,
                 output_dir=output_dir,
                 plots=True,
                 tag=f"_{protein}_{target}",
                 n_jobs=12,
                 calibration="auto",
                 optimize_threshold=True,
-                pos_weight_factor=1.5,
+                pos_weight_factor=1.2,
             )
