@@ -44,10 +44,13 @@ from ..utils import (
     metric_is_lower_better,
     plot_pr_curve,
     plot_pr_curve_grouped,
+    plot_pr_curve_cfc_tts,
     plot_roc_curve,
     plot_roc_curve_grouped,
+    plot_roc_curve_cfc_tts,
     plot_ks_statistic,
     plot_ks_statistic_grouped,
+    plot_ks_statistic_cfc_tts,
     plot_calibration_curve,
     plot_calibration_curve_grouped,
     fit_score_calibrator,
@@ -1041,13 +1044,12 @@ def nested_crossval(
             random_state=random_state,
             max_svm_samples=max_svm_samples,
         )
-        cfc_oof = pd.concat(
-            [pred_store_cfc[(fk, si)] for si in range(n_cfc_splits)],
-            axis=0,
-        )
+        cfc_by_split = {si: pred_store_cfc[(fk, si)] for si in range(n_cfc_splits)}
+        cfc_oof = pd.concat([cfc_by_split[si] for si in range(n_cfc_splits)], axis=0)
         best_predictions[fk] = {
             "inner": inner_oof[fk][pct],
             "cfc": cfc_oof,
+            "cfc_by_split": cfc_by_split,
             "tts": pred_store_tts[fk],
         }
 
@@ -1371,25 +1373,43 @@ def magic_now(
 
     # Select best model using sqrt(FNFP CFC**2 + FNFP TTS**2) from validation table
     best_fold_key = None
+    best_label = None
+    best_threshold = 0.5
     best_metric = float("inf")
 
-    for fold_key in validation.index.get_level_values(0).unique():
-        fold_data = validation.loc[fold_key]
+    if "FNFP loss CFC" in validation.columns and "FNFP loss TTS" in validation.columns:
+        metrics = (
+            validation["FNFP loss CFC"] ** 2 + validation["FNFP loss TTS"] ** 2
+        ) ** 0.5
+        best_pos = int(np.argmin(metrics.to_numpy())) if len(metrics) else None
+        if best_pos is not None:
+            best_fold_key = validation.index[best_pos]
+            best_row = validation.iloc[best_pos]
+            best_metric = float(metrics.iloc[best_pos])
+            best_label = best_row.get("label")
+            best_threshold = float(best_row.get("threshold", 0.5))
 
-        # Use existing FNFP loss columns from validation table
-        fnfp_cfc = fold_data["FNFP loss CFC"]
-        fnfp_tts = fold_data["FNFP loss TTS"]
-
-        # Calculate combined metric: sqrt(FNFPCFC**2 + FNFPTTS**2)
-        metric = (fnfp_cfc**2 + fnfp_tts**2) ** 0.5
-
-        if metric < best_metric:
-            best_metric = metric
-            best_fold_key = fold_key
-
-    # Save best model
+    # Save best model (fold + variant aware)
     if best_fold_key is not None:
-        best_model = model_payload[best_fold_key]
+        if best_label == "raw model" or not best_label:
+            best_model = pipeline_by_fold[best_fold_key]
+        elif best_label == "calibrated model":
+            calibrator = calibrated_artifacts.get(best_fold_key)
+            if calibrator is None:
+                best_model = pipeline_by_fold[best_fold_key]
+            else:
+                best_model = CalibratedThresholdedClassifier(
+                    pipeline=pipeline_by_fold[best_fold_key],
+                    calibrator=calibrator.calibrator,
+                    threshold=0.5,
+                )
+        elif best_label == "calibrated model with threshold":
+            best_model = calibrated_artifacts.get(
+                best_fold_key, pipeline_by_fold[best_fold_key]
+            )
+        else:
+            best_model = model_payload[best_fold_key]
+
         with open(models_dir / f"pipeline{tag}.pkl", "wb") as handle:
             pickle.dump(best_model, handle)
 
@@ -1405,51 +1425,65 @@ def magic_now(
     # TTS is plotted as single curve                                       #
     # ---------------------------------------------------------------------#
     if plots and best_fold_key is not None:
-        best_cfc_df = predictions_by_fold[best_fold_key]["cfc"]
+        best_cfc_by_split = predictions_by_fold[best_fold_key].get("cfc_by_split")
         best_tts_df = predictions_by_fold[best_fold_key]["tts"]
+        if not best_cfc_by_split:
+            best_cfc_by_split = {
+                best_fold_key: predictions_by_fold[best_fold_key]["cfc"]
+            }
 
-        # Apply calibrator if available
-        if best_fold_key in calibrated_artifacts:
-            art = calibrated_artifacts[best_fold_key]
-            if art.calibrator is not None:
-                best_cfc_df = best_cfc_df.copy()
+        # Apply calibrator only for calibrated variants
+        if best_label in ("calibrated model", "calibrated model with threshold"):
+            art = calibrated_artifacts.get(best_fold_key)
+            if art is not None and art.calibrator is not None:
                 best_tts_df = best_tts_df.copy()
-                best_cfc_df["score"] = art.calibrator.predict(
-                    best_cfc_df["score"].to_numpy(dtype=float)
-                )
                 best_tts_df["score"] = art.calibrator.predict(
                     best_tts_df["score"].to_numpy(dtype=float)
                 )
+                calibrated_cfc = {}
+                for split_key, df in best_cfc_by_split.items():
+                    df_cal = df.copy()
+                    df_cal["score"] = art.calibrator.predict(
+                        df_cal["score"].to_numpy(dtype=float)
+                    )
+                    calibrated_cfc[split_key] = df_cal
+                best_cfc_by_split = calibrated_cfc
 
-        plot_groups = [
-            {
-                "label": "CFC (mean±std)",
-                "color": "tab:blue",
-                "linestyle": "-",
-                "preds": {best_fold_key: best_cfc_df},
-            },
-            {
-                "label": "TTS",
-                "color": "tab:orange",
-                "linestyle": "-",
-                "preds": {best_fold_key: best_tts_df},
-            },
-        ]
-
-        plot_pr_curve_grouped(
-            plot_groups,
+        plot_pr_curve_cfc_tts(
+            best_cfc_by_split,
+            best_tts_df,
             plots_dir / f"pr_curve{tag}.pdf",
             title=f"PR — Best Model {best_fold_key}",
         )
-        plot_roc_curve_grouped(
-            plot_groups,
+        plot_roc_curve_cfc_tts(
+            best_cfc_by_split,
+            best_tts_df,
             plots_dir / f"roc_curve{tag}.pdf",
             title=f"ROC — Best Model {best_fold_key}",
         )
-        plot_ks_statistic_grouped(
-            plot_groups,
+        plot_ks_statistic_cfc_tts(
+            best_cfc_by_split,
+            best_tts_df,
             plots_dir / f"ks_statistic{tag}.pdf",
             title=f"KS Statistic — Best Model {best_fold_key}",
+        )
+        plot_calibration_curve_grouped(
+            [
+                {
+                    "label": "CFC",
+                    "color": "tab:blue",
+                    "linestyle": "-",
+                    "preds": best_cfc_by_split,
+                },
+                {
+                    "label": "TTS",
+                    "color": "tab:orange",
+                    "linestyle": "-",
+                    "preds": {best_fold_key: best_tts_df},
+                },
+            ],
+            plots_dir / f"calibration_diagnostic{tag}.pdf",
+            title=f"Calibration — Best Model {best_fold_key} (CFC vs TTS)",
         )
 
     n_1 = int((y == 1).sum())

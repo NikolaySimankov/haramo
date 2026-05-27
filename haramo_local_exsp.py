@@ -60,16 +60,16 @@ if __name__ == "__main__":
 
     # Load the feature DataFrames
     feature_files = {
-        "ctd": "X_ctd.tsv",
-        "ctdc": "X_ctdc.tsv",
-        "ctdt": "X_ctdt.tsv",
+        # "ctd": "X_ctd.tsv",
+        # "ctdc": "X_ctdc.tsv",
+        # "ctdt": "X_ctdt.tsv",
         "ctdd": "X_ctdd.tsv",
         # "aac": "X_aac.tsv",
-        "b2b": "X_b2btools.tsv",
+        # "b2b": "X_b2btools.tsv",
         "nsp": "X_netsurfp.tsv",
         # "residue": "X_residue.tsv",
-        "biophys": "X_biophys.tsv",
-        "class": "X_class.tsv",
+        # "biophys": "X_biophys.tsv",
+        # "class": "X_class.tsv",
     }
 
     all_X = {
@@ -92,17 +92,17 @@ if __name__ == "__main__":
     # Split comma-separated values and remove duplicates
     proteins = [
         # "DNA replication protein",
-        "RNA-dependent RNA polymerase",
+        # "RNA-dependent RNA polymerase",
         # "DNA-RNA polymerase superfamily",
         # "Reverse transcriptase",
-        "Coat protein",
-        "Movement protein",
+        # "Coat protein",
+        # "Movement protein",
         # "Transactivator-Viroplasmin protein",
-        "RNA silencing suppressor",
+        # "RNA silencing suppressor",
         # "Vector transmission protein",
         # "RNA-dependent RNA polymerase complex",
         # "Reverse transcriptase complex",
-        # "Glycoprotein",
+        "Glycoprotein",
     ]
 
     for protein in proteins:
@@ -150,10 +150,10 @@ if __name__ == "__main__":
                 outer_cv_groups=groups,
                 inner_cv_groups=groups,
                 scoring="FNFP",
-                algorithm=["CatB"],
+                algorithm=["LGBM"],
                 scaler="robust",
                 feature_selector="pvalue",
-                hyperparameters="optimize",
+                hyperparameters="default",
                 n_trials=10,
                 output_dir=output_dir,
                 plots=True,

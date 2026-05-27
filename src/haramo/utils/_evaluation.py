@@ -554,6 +554,102 @@ def plot_pr_curve(predictions_by_model, output_path, title=None, mark_cutoff=0.5
     plt.close(fig)
 
 
+def plot_pr_curve_cfc_tts(
+    cfc_predictions_by_split,
+    tts_predictions,
+    output_path,
+    title=None,
+    mark_cutoff=0.5,
+):
+    """Plot CFC folds with mean±std band + a single TTS curve.
+
+    Parameters
+    ----------
+    cfc_predictions_by_split : dict[str, pd.DataFrame]
+        Mapping ``split_key -> DataFrame`` with columns
+        ``["true", "predicted", "score"]`` for each CFC validation fold.
+    tts_predictions : pd.DataFrame
+        DataFrame with columns ``["true", "predicted", "score"]`` for TTS.
+    output_path : path-like
+    title : str, optional
+    mark_cutoff : float, default 0.5
+        Marker for the average ``(recall, precision)`` at this threshold
+        across CFC folds. Pass ``None`` to skip.
+    """
+    fig, ax = plt.subplots(figsize=(6, 6))
+    aps, per_model = [], []
+    recall_grid = np.linspace(0, 1, 100)
+
+    for split_key, df in sorted(cfc_predictions_by_split.items()):
+        y_true = df["true"].to_numpy()
+        y_score = df["score"].to_numpy()
+        precision, recall, _ = precision_recall_curve(y_true, y_score)
+        ap = average_precision_score(y_true, y_score)
+        aps.append(ap)
+        per_model.append((recall[::-1], precision[::-1]))
+        ax.plot(recall, precision, alpha=0.35, lw=1, color="tab:blue")
+
+    if per_model:
+        mean_p, std_p = _aggregate_curves(per_model, recall_grid)
+        ax.plot(
+            recall_grid,
+            mean_p,
+            color="tab:blue",
+            lw=2,
+            label=rf"CFC mean (AP = {np.mean(aps):.2f} $\pm$ {np.std(aps):.2f})",
+        )
+        ax.fill_between(
+            recall_grid,
+            np.clip(mean_p - std_p, 0, 1),
+            np.clip(mean_p + std_p, 0, 1),
+            color="tab:blue",
+            alpha=0.15,
+        )
+
+    if tts_predictions is not None and not tts_predictions.empty:
+        y_true = tts_predictions["true"].to_numpy()
+        y_score = tts_predictions["score"].to_numpy()
+        precision, recall, _ = precision_recall_curve(y_true, y_score)
+        ap = average_precision_score(y_true, y_score)
+        ax.plot(
+            recall,
+            precision,
+            color="tab:orange",
+            lw=2,
+            label=f"TTS (AP={ap:.2f})",
+        )
+
+    if mark_cutoff is not None and per_model:
+        rs, ps = [], []
+        for df in cfc_predictions_by_split.values():
+            y_true = df["true"].to_numpy()
+            y_score = df["score"].to_numpy()
+            y_pred_cut = (y_score >= mark_cutoff).astype(int)
+            rs.append(recall_score(y_true, y_pred_cut, zero_division=0))
+            ps.append(precision_score(y_true, y_pred_cut, zero_division=0))
+        ax.plot(
+            np.mean(rs),
+            np.mean(ps),
+            marker="o",
+            markersize=8,
+            color="tab:blue",
+            label=f"Default cut-off @ p={mark_cutoff}",
+        )
+
+    ax.set(
+        xlabel="Recall",
+        ylabel="Precision",
+        xlim=(-0.01, 1.01),
+        ylim=(-0.01, 1.01),
+        title=title or "Precision-Recall curve (CFC folds + TTS)",
+    )
+    ax.legend(loc="lower left", fontsize=8)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(output_path)
+    plt.close(fig)
+
+
 def plot_ks_statistic(predictions_by_model, output_path, title=None, n_deciles=10):
     """Plot per-model KS curves (cum-positive vs cum-negative) + mean band.
 
@@ -647,6 +743,90 @@ def plot_ks_statistic(predictions_by_model, output_path, title=None, n_deciles=1
         xlim=(0, n_deciles),
         ylim=(0, 1),
         title=title or "KS statistic (outer-fold models)",
+    )
+    ax.legend(loc="lower right", fontsize=8)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(output_path)
+    plt.close(fig)
+
+
+def plot_ks_statistic_cfc_tts(
+    cfc_predictions_by_split,
+    tts_predictions,
+    output_path,
+    title=None,
+    n_deciles=10,
+):
+    """Plot CFC mean cum-pos/neg curves and TTS cum-pos/neg curves.
+
+    CFC uses mean curves across splits (negatives dotted). TTS is a single
+    curve pair in another color (negatives dotted).
+    """
+    fig, ax = plt.subplots(figsize=(6, 6))
+    deciles = np.arange(0, n_deciles + 1)
+
+    pos_curves, neg_curves = [], []
+    for df in cfc_predictions_by_split.values():
+        y_true = df["true"].to_numpy().astype(int)
+        y_score = df["score"].to_numpy(dtype=float)
+        dt = decile_table_ks(y_true, y_score, n_deciles=n_deciles)
+        pos_curves.append(np.append(0.0, dt["cum_positive_rate"].values))
+        neg_curves.append(np.append(0.0, dt["cum_negative_rate"].values))
+
+    if pos_curves:
+        pos_arr = np.asarray(pos_curves)
+        neg_arr = np.asarray(neg_curves)
+        mean_pos = pos_arr.mean(axis=0)
+        mean_neg = neg_arr.mean(axis=0)
+        ax.plot(
+            deciles,
+            mean_pos,
+            marker="o",
+            color="tab:blue",
+            lw=2,
+            label="CFC mean cum. positives",
+        )
+        ax.plot(
+            deciles,
+            mean_neg,
+            marker="o",
+            color="tab:blue",
+            lw=2,
+            linestyle=":",
+            label="CFC mean cum. negatives",
+        )
+
+    if tts_predictions is not None and not tts_predictions.empty:
+        y_true = tts_predictions["true"].to_numpy().astype(int)
+        y_score = tts_predictions["score"].to_numpy(dtype=float)
+        dt = decile_table_ks(y_true, y_score, n_deciles=n_deciles)
+        tts_pos = np.append(0.0, dt["cum_positive_rate"].values)
+        tts_neg = np.append(0.0, dt["cum_negative_rate"].values)
+        ax.plot(
+            deciles,
+            tts_pos,
+            marker="o",
+            color="tab:orange",
+            lw=2,
+            label="TTS cum. positives",
+        )
+        ax.plot(
+            deciles,
+            tts_neg,
+            marker="o",
+            color="tab:orange",
+            lw=2,
+            linestyle=":",
+            label="TTS cum. negatives",
+        )
+
+    ax.set(
+        xlabel="Deciles",
+        ylabel="Cumulative rate",
+        xlim=(0, n_deciles),
+        ylim=(0, 1),
+        title=title or "KS statistic (CFC mean vs TTS)",
     )
     ax.legend(loc="lower right", fontsize=8)
     ax.grid(True, alpha=0.3)
@@ -999,6 +1179,80 @@ def plot_roc_curve(predictions_by_model, output_path, title=None):
         title=title or "ROC curve (outer-fold models)",
     )
     ax.legend(loc="lower right", fontsize=8)
+    plt.tight_layout()
+    plt.savefig(output_path)
+    plt.close(fig)
+
+
+def plot_roc_curve_cfc_tts(
+    cfc_predictions_by_split,
+    tts_predictions,
+    output_path,
+    title=None,
+):
+    """Plot CFC folds with mean±std band + a single TTS ROC curve."""
+    fig, ax = plt.subplots(figsize=(6, 6))
+    aucs, per_model = [], []
+    fpr_grid = np.linspace(0, 1, 100)
+
+    for df in cfc_predictions_by_split.values():
+        y_true = df["true"].to_numpy()
+        y_score = df["score"].to_numpy()
+        fpr, tpr, _ = roc_curve(y_true, y_score)
+        roc_auc_val = auc(fpr, tpr)
+        aucs.append(roc_auc_val)
+        per_model.append((fpr, tpr))
+        ax.plot(fpr, tpr, alpha=0.35, lw=1, color="tab:blue")
+
+    if per_model:
+        mean_tpr, std_tpr = _aggregate_curves(per_model, fpr_grid)
+        mean_tpr[0], mean_tpr[-1] = 0.0, 1.0
+        ax.plot(
+            fpr_grid,
+            mean_tpr,
+            color="tab:blue",
+            lw=2,
+            label=rf"CFC mean (AUC = {np.mean(aucs):.2f} $\pm$ {np.std(aucs):.2f})",
+        )
+        ax.fill_between(
+            fpr_grid,
+            np.clip(mean_tpr - std_tpr, 0, 1),
+            np.clip(mean_tpr + std_tpr, 0, 1),
+            color="tab:blue",
+            alpha=0.15,
+        )
+
+    if tts_predictions is not None and not tts_predictions.empty:
+        y_true = tts_predictions["true"].to_numpy()
+        y_score = tts_predictions["score"].to_numpy()
+        fpr, tpr, _ = roc_curve(y_true, y_score)
+        roc_auc_val = auc(fpr, tpr)
+        ax.plot(
+            fpr,
+            tpr,
+            color="tab:orange",
+            lw=2,
+            label=f"TTS (AUC={roc_auc_val:.2f})",
+        )
+
+    ax.plot(
+        [0, 1],
+        [0, 1],
+        linestyle="--",
+        color="gray",
+        alpha=0.5,
+        label="Chance",
+    )
+
+    ax.set(
+        xlabel="False Positive Rate",
+        ylabel="True Positive Rate",
+        xlim=(-0.01, 1.01),
+        ylim=(-0.01, 1.01),
+        title=title or "ROC curve (CFC folds + TTS)",
+    )
+    ax.legend(loc="lower right", fontsize=8)
+    ax.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.savefig(output_path)
     plt.close(fig)
