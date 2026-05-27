@@ -1132,7 +1132,7 @@ def magic_now(
         best_combo_name, X, scores_series = select_best_dataset_combo(
             datasets=datasets,
             y=y,
-            scoring=scoring,
+            scoring="KS",
             task=task,
             random_state=random_state,
             inner_cv_groups=inner_cv_groups,

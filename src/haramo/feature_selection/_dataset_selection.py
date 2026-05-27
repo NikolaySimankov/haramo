@@ -122,14 +122,20 @@ def select_best_dataset_combo(
 
     Algorithm
     ---------
-    1. Score every singleton in parallel → rank, keep the top ``beam_width``
-       as the current beam.
-    2. For every combo in the beam, score all extensions (combo + one remaining
-       dataset not already in that combo) in parallel.
-    3. Rank all extension scores → keep the top ``beam_width`` as the new beam.
-       Stop if the best score in the new beam does not improve on the best score
-       from the previous step.
-    4. Return the overall best combo seen across all steps.
+    1. Partition ``datasets`` by name case:
+       - ``mandatory`` = names matching ``str.isupper()``; always included
+         in every candidate combo.
+       - ``optional`` = the rest; subject to the beam search.
+    2. Seed the beam:
+       - If any mandatory datasets exist, the starting beam is a single
+         entry holding the full mandatory bundle.
+       - Otherwise, score every optional singleton in parallel and keep
+         the top ``beam_width`` as the starting beam.
+    3. For every combo in the beam, score all extensions (combo + one
+       optional dataset not already in it) in parallel.
+    4. Rank all extension scores → keep the top ``beam_width`` as the new
+       beam. Stop if the best score does not improve on the previous best.
+    5. Return the overall best combo seen across all steps.
 
     Worst-case evaluations: ``n + beam_width*(n-1) + beam_width*(n-2) + …``
     which for ``beam_width=2`` and ``n`` datasets is roughly ``2n²/2 = n²``,
@@ -139,7 +145,8 @@ def select_best_dataset_combo(
     ----------
     datasets : dict
         Mapping ``name → DataFrame``.  All DataFrames must share the same
-        index as ``y``.
+        index as ``y``. Names in ALL CAPS (``name.isupper()``) are treated
+        as mandatory and forced into every candidate combination.
     y : pd.Series
         Target vector.
     scoring : str or callable, default ``"PR AUC"``
@@ -163,8 +170,8 @@ def select_best_dataset_combo(
         Mean CV score for every evaluated combination (all steps),
         sorted descending.
     """
-    names = list(datasets.keys())
-    n = len(names)
+    mandatory = tuple(n for n in datasets if n.isupper())
+    optional = [n for n in datasets if not n.isupper()]
     all_scores: dict = {}
 
     def _score_one(combo: tuple) -> tuple:
@@ -175,34 +182,49 @@ def select_best_dataset_combo(
         return combo, score
 
     # ------------------------------------------------------------------ #
-    # Step 1 – score every singleton, seed the beam                       #
+    # Step 1 – seed the beam                                              #
     # ------------------------------------------------------------------ #
-    print(f"[Dataset Selection] Step 1: scoring {n} singleton(s) …")
-    results = Parallel(n_jobs=n_jobs)(delayed(_score_one)((name,)) for name in names)
-    for combo, score in results:
-        all_scores[" + ".join(combo)] = score
+    if mandatory:
+        print(
+            f"[Dataset Selection] Mandatory base: {' + '.join(mandatory)!r} "
+            f"({len(optional)} optional dataset(s) to search)"
+        )
+        base_combo, base_score = _score_one(mandatory)
+        all_scores[" + ".join(base_combo)] = base_score
+        beam = [base_combo]
+        best_score = base_score
+        print(f"[Dataset Selection] Base score = {best_score:.4f}")
+    else:
+        print(f"[Dataset Selection] Step 1: scoring {len(optional)} singleton(s) …")
+        results = Parallel(n_jobs=n_jobs)(
+            delayed(_score_one)((name,)) for name in optional
+        )
+        for combo, score in results:
+            all_scores[" + ".join(combo)] = score
 
-    results_sorted = sorted(
-        results, key=lambda x: x[1] if not np.isnan(x[1]) else -np.inf, reverse=True
-    )
-    beam = [combo for combo, _ in results_sorted[:beam_width]]
-    best_score = results_sorted[0][1]
+        results_sorted = sorted(
+            results,
+            key=lambda x: x[1] if not np.isnan(x[1]) else -np.inf,
+            reverse=True,
+        )
+        beam = [combo for combo, _ in results_sorted[:beam_width]]
+        best_score = results_sorted[0][1]
 
-    print(
-        f"[Dataset Selection] Top-{beam_width} singletons: "
-        + ", ".join(f"{' + '.join(c)!r}" for c in beam)
-        + f" | best score={best_score:.4f}"
-    )
+        print(
+            f"[Dataset Selection] Top-{beam_width} singletons: "
+            + ", ".join(f"{' + '.join(c)!r}" for c in beam)
+            + f" | best score={best_score:.4f}"
+        )
 
     # ------------------------------------------------------------------ #
-    # Steps 2+ – beam extension                                           #
+    # Steps 2+ – beam extension (only optional datasets are added)        #
     # ------------------------------------------------------------------ #
     step = 2
     while True:
         # Build all candidate extensions across every combo in the beam.
-        # Each combo is extended with every dataset not already in it.
+        # Each combo is extended with every optional dataset not already in it.
         candidates = [
-            combo + (name,) for combo in beam for name in names if name not in combo
+            combo + (name,) for combo in beam for name in optional if name not in combo
         ]
 
         if not candidates:

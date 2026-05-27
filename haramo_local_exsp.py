@@ -66,7 +66,7 @@ if __name__ == "__main__":
         "ctdd": "X_ctdd.tsv",
         # "aac": "X_aac.tsv",
         # "b2b": "X_b2btools.tsv",
-        "nsp": "X_netsurfp.tsv",
+        "NSP": "X_netsurfp.tsv",
         # "residue": "X_residue.tsv",
         "biophys": "X_biophys.tsv",
         "class": "X_class.tsv",
@@ -144,7 +144,7 @@ if __name__ == "__main__":
             groups = groups.loc[y.index]
             datasets = {name: X.loc[y.index] for name, X in datasets.items()}
 
-            for algorithm in ["LGBM", "XGB"]:
+            for algorithm in ["LGBM"]:
 
                 magic_now(
                     X=datasets,
@@ -156,10 +156,10 @@ if __name__ == "__main__":
                     scaler="robust",
                     feature_selector="pvalue",
                     hyperparameters="optimize",
-                    n_trials=30,
+                    n_trials=10,
                     output_dir=output_dir,
                     plots=True,
-                    tag=f"_{protein}_{target}",
+                    tag=f"_{protein}_{algorithm}_{target}",
                     n_jobs=12,
                     calibration="auto",
                     optimize_threshold=True,
