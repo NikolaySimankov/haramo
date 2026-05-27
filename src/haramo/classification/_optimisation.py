@@ -1408,12 +1408,8 @@ def magic_now(
     # TTS is plotted as single curve                                       #
     # ---------------------------------------------------------------------#
     if plots and best_fold_key is not None:
-        best_cfc_by_split = predictions_by_fold[best_fold_key].get("cfc_by_split")
+        best_cfc_df = predictions_by_fold[best_fold_key]["cfc"]
         best_tts_df = predictions_by_fold[best_fold_key]["tts"]
-        if not best_cfc_by_split:
-            best_cfc_by_split = {
-                best_fold_key: predictions_by_fold[best_fold_key]["cfc"]
-            }
 
         # Apply calibrator only for calibrated variants
         if best_label in ("calibrated model", "calibrated model with threshold"):
@@ -1423,29 +1419,25 @@ def magic_now(
                 best_tts_df["score"] = art.calibrator.predict(
                     best_tts_df["score"].to_numpy(dtype=float)
                 )
-                calibrated_cfc = {}
-                for split_key, df in best_cfc_by_split.items():
-                    df_cal = df.copy()
-                    df_cal["score"] = art.calibrator.predict(
-                        df_cal["score"].to_numpy(dtype=float)
-                    )
-                    calibrated_cfc[split_key] = df_cal
-                best_cfc_by_split = calibrated_cfc
+                best_cfc_df = best_cfc_df.copy()
+                best_cfc_df["score"] = art.calibrator.predict(
+                    best_cfc_df["score"].to_numpy(dtype=float)
+                )
 
         plot_pr_curve(
-            best_cfc_by_split,
+            best_cfc_df,
             best_tts_df,
             plots_dir / f"pr_curve{tag}.pdf",
             title=f"PR — Best Model {best_fold_key}",
         )
         plot_roc_curve(
-            best_cfc_by_split,
+            best_cfc_df,
             best_tts_df,
             plots_dir / f"roc_curve{tag}.pdf",
             title=f"ROC — Best Model {best_fold_key}",
         )
         plot_ks_statistic(
-            best_cfc_by_split,
+            best_cfc_df,
             best_tts_df,
             plots_dir / f"ks_statistic{tag}.pdf",
             title=f"KS Statistic — Best Model {best_fold_key}",
