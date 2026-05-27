@@ -28,15 +28,8 @@ from ._evaluation import (
     scoring_to_metric_column,
     metric_is_lower_better,
     plot_pr_curve,
-    plot_pr_curve_cfc_tts,
-    plot_pr_curve_grouped,
     plot_roc_curve,
-    plot_roc_curve_cfc_tts,
-    plot_roc_curve_grouped,
     plot_ks_statistic,
-    plot_ks_statistic_cfc_tts,
-    plot_ks_statistic_grouped,
-    plot_calibration_curve_grouped,
     plot_confusion_matrix,
 )
 

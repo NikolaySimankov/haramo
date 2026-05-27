@@ -15,6 +15,9 @@ from sklearn.metrics import (
     balanced_accuracy_score,
     cohen_kappa_score,
 )
+
+from ._evaluation import fn_fp_loss
+
 from sklearn.model_selection import StratifiedKFold, train_test_split
 
 import matplotlib.pyplot as plt
@@ -258,35 +261,24 @@ def pick_best_score_calibration_method(
     return best_method, best_brier
 
 
-# Label-based metrics suitable for threshold tuning. Threshold-free metrics
-# (PR AUC, ROC AUC, KS, Brier) are NOT in this map — passing them falls
-# back to MCC with a printed note.
-def _fn_fp_loss_label(y_true, y_pred):
-    """Lazy wrapper so :data:`_THRESHOLD_METRIC_FNS` can reference ``fn_fp_loss``
-    without a top-level circular import from ``_evaluation``."""
-    from ._evaluation import fn_fp_loss
-
-    return fn_fp_loss(y_true, y_pred)
-
-
 _THRESHOLD_METRIC_FNS = {
     "MCC": matthews_corrcoef,
     "F1-score": f1_score,
     "Bal. Acc.": balanced_accuracy_score,
     "Kappa": cohen_kappa_score,
-    "FNFP Loss": _fn_fp_loss_label,
+    "FNFP": fn_fp_loss,
 }
 
 
-def find_best_threshold(y_true, y_score, metric="FNFP Loss", n_thresholds=101):
+def find_best_threshold(y_true, y_score, metric="FNFP", n_thresholds=50):
     """Scan thresholds in ``[0, 1]``; return ``(best_threshold, best_value, metric_used)``.
 
     ``metric`` is any identifier accepted by ``scoring_to_metric_column``.
     For higher-is-better metrics (MCC, F1, ...) the threshold maximising the
-    metric is returned; for lower-is-better losses (FNFP Loss) the minimising
+    metric is returned; for lower-is-better losses (FNFP loss) the minimising
     threshold is returned. **Anything else** — threshold-free metrics (PR AUC,
     ROC AUC, KS, Brier), callables, or unrecognised strings — falls back to
-    FNFP Loss with a printed note. The third return value is the name of the
+    FNFP loss with a printed note. The third return value is the name of the
     metric actually used.
     """
     from ._evaluation import scoring_to_metric_column, metric_is_lower_better
@@ -297,15 +289,15 @@ def find_best_threshold(y_true, y_score, metric="FNFP Loss", n_thresholds=101):
     if resolved is _UNRECOGNISED:
         print(
             f"[threshold] scoring {metric!r} is not recognised for "
-            "threshold tuning; falling back to FNFP Loss."
+            "threshold tuning; falling back to FNFP."
         )
-        metric_col = "FNFP Loss"
+        metric_col = "FNFP"
     elif resolved not in _THRESHOLD_METRIC_FNS:
         print(
             f"[threshold] {resolved!r} is threshold-free; "
-            "falling back to FNFP Loss for threshold scan."
+            "falling back to FNFP loss for threshold scan."
         )
-        metric_col = "FNFP Loss"
+        metric_col = "FNFP"
     else:
         metric_col = resolved
 
@@ -314,7 +306,7 @@ def find_best_threshold(y_true, y_score, metric="FNFP Loss", n_thresholds=101):
 
     y_true = np.asarray(y_true).astype(int)
     y_score = np.asarray(y_score, dtype=float)
-    thresholds = np.linspace(0.0, 1.0, n_thresholds)
+    thresholds = np.linspace(0.2, 0.8, n_thresholds)
     scores = np.array([fn(y_true, (y_score >= t).astype(int)) for t in thresholds])
     best_idx = int(np.argmin(scores) if lower_better else np.argmax(scores))
     return float(thresholds[best_idx]), float(scores[best_idx]), metric_col

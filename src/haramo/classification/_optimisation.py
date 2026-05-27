@@ -10,7 +10,7 @@ import numpy as np
 import pickle
 
 from joblib import Parallel, delayed
-from typing import Union, Callable, Dict, List, Optional
+from typing import Union, Callable, Dict, List
 from os import PathLike
 
 from sklearn.base import clone
@@ -18,9 +18,7 @@ from sklearn.utils.class_weight import compute_sample_weight
 from sklearn.model_selection import (
     StratifiedKFold,
     StratifiedGroupKFold,
-    cross_val_predict,
 )
-from sklearn.svm import SVC
 
 from math import sqrt
 
@@ -43,20 +41,11 @@ from ..utils import (
     scoring_to_metric_column,
     metric_is_lower_better,
     plot_pr_curve,
-    plot_pr_curve_grouped,
-    plot_pr_curve_cfc_tts,
     plot_roc_curve,
-    plot_roc_curve_grouped,
-    plot_roc_curve_cfc_tts,
     plot_ks_statistic,
-    plot_ks_statistic_grouped,
-    plot_ks_statistic_cfc_tts,
-    plot_calibration_curve,
-    plot_calibration_curve_grouped,
     fit_score_calibrator,
     pick_best_score_calibration_method,
     find_best_threshold,
-    compute_calibration_variants,
     CalibratedThresholdedClassifier,
 )
 from ..feature_selection import select_best_dataset_combo, select_best_feature_selector
@@ -1377,10 +1366,8 @@ def magic_now(
     best_threshold = 0.5
     best_metric = float("inf")
 
-    if "FNFP loss CFC" in validation.columns and "FNFP loss TTS" in validation.columns:
-        metrics = (
-            validation["FNFP loss CFC"] ** 2 + validation["FNFP loss TTS"] ** 2
-        ) ** 0.5
+    if "FNFP CFC" in validation.columns and "FNFP TTS" in validation.columns:
+        metrics = (validation["FNFP CFC"] ** 2 + validation["FNFP TTS"] ** 2) ** 0.5
         best_pos = int(np.argmin(metrics.to_numpy())) if len(metrics) else None
         if best_pos is not None:
             best_fold_key = validation.index[best_pos]
@@ -1449,41 +1436,23 @@ def magic_now(
                     calibrated_cfc[split_key] = df_cal
                 best_cfc_by_split = calibrated_cfc
 
-        plot_pr_curve_cfc_tts(
+        plot_pr_curve(
             best_cfc_by_split,
             best_tts_df,
             plots_dir / f"pr_curve{tag}.pdf",
             title=f"PR — Best Model {best_fold_key}",
         )
-        plot_roc_curve_cfc_tts(
+        plot_roc_curve(
             best_cfc_by_split,
             best_tts_df,
             plots_dir / f"roc_curve{tag}.pdf",
             title=f"ROC — Best Model {best_fold_key}",
         )
-        plot_ks_statistic_cfc_tts(
+        plot_ks_statistic(
             best_cfc_by_split,
             best_tts_df,
             plots_dir / f"ks_statistic{tag}.pdf",
             title=f"KS Statistic — Best Model {best_fold_key}",
-        )
-        plot_calibration_curve_grouped(
-            [
-                {
-                    "label": "CFC",
-                    "color": "tab:blue",
-                    "linestyle": "-",
-                    "preds": best_cfc_by_split,
-                },
-                {
-                    "label": "TTS",
-                    "color": "tab:orange",
-                    "linestyle": "-",
-                    "preds": {best_fold_key: best_tts_df},
-                },
-            ],
-            plots_dir / f"calibration_diagnostic{tag}.pdf",
-            title=f"Calibration — Best Model {best_fold_key} (CFC vs TTS)",
         )
 
     n_1 = int((y == 1).sum())
