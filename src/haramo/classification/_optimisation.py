@@ -1363,8 +1363,6 @@ def magic_now(
     # Select best model using sqrt(FNFP CFC**2 + FNFP TTS**2) from validation table
     best_fold_key = None
     best_label = None
-    best_threshold = 0.5
-    best_metric = float("inf")
 
     if "FNFP CFC" in validation.columns and "FNFP TTS" in validation.columns:
         metrics = (validation["FNFP CFC"] ** 2 + validation["FNFP TTS"] ** 2) ** 0.5
@@ -1372,9 +1370,7 @@ def magic_now(
         if best_pos is not None:
             best_fold_key = validation.index[best_pos]
             best_row = validation.iloc[best_pos]
-            best_metric = float(metrics.iloc[best_pos])
             best_label = best_row.get("label")
-            best_threshold = float(best_row.get("threshold", 0.5))
 
     # Save best model (fold + variant aware)
     if best_fold_key is not None:
