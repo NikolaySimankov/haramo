@@ -22,6 +22,8 @@ from sklearn.model_selection import (
 )
 from sklearn.svm import SVC
 
+from math import sqrt
+
 from sklearn.pipeline import Pipeline
 
 from optuna import (
@@ -1358,13 +1360,38 @@ def magic_now(
         validation["threshold"] = 0.5
 
     # ---------------------------------------------------------------------#
-    # Persist artefacts. Single pickle keyed by fold_key; values are       #
-    # CalibratedThresholdedClassifier (when calibration/threshold are on)  #
-    # or bare pipelines (otherwise). Both expose the sklearn API.          #
+    # Persist artefacts. All models saved as all_pipelines_{tag}.pkl      #
+    # Select best model using sqrt(FNFPCFC**2+FNFPTTS**2) metric          #
+    # Save best model as pipeline_{tag}.pkl                               #
+    # Both CalibratedThresholdedClassifier and bare pipelines supported.  #
     # ---------------------------------------------------------------------#
     model_payload = calibrated_artifacts if calibrated_artifacts else pipeline_by_fold
-    with open(models_dir / f"pipelines{tag}.pkl", "wb") as handle:
+    with open(models_dir / f"all_pipelines{tag}.pkl", "wb") as handle:
         pickle.dump(model_payload, handle)
+
+    # Select best model using sqrt(FNFP CFC**2 + FNFP TTS**2) from validation table
+    best_fold_key = None
+    best_metric = float("inf")
+
+    for fold_key in validation.index.get_level_values(0).unique():
+        fold_data = validation.loc[fold_key]
+
+        # Use existing FNFP loss columns from validation table
+        fnfp_cfc = fold_data["FNFP loss CFC"]
+        fnfp_tts = fold_data["FNFP loss TTS"]
+
+        # Calculate combined metric: sqrt(FNFPCFC**2 + FNFPTTS**2)
+        metric = (fnfp_cfc**2 + fnfp_tts**2) ** 0.5
+
+        if metric < best_metric:
+            best_metric = metric
+            best_fold_key = fold_key
+
+    # Save best model
+    if best_fold_key is not None:
+        best_model = model_payload[best_fold_key]
+        with open(models_dir / f"pipeline{tag}.pkl", "wb") as handle:
+            pickle.dump(best_model, handle)
 
     with open(
         trials_dir / f"studies{tag}.pkl",
@@ -1373,97 +1400,57 @@ def magic_now(
         pickle.dump(studies, handle)
 
     # ---------------------------------------------------------------------#
-    # Plots: PR / ROC / KS shown for both grids (CFC vs TTS) and both      #
-    # variants (Raw vs Calibrated) on the same axes. Color = grid,        #
-    # linestyle = variant.                                                 #
+    # Plots: Best model only — PR / ROC / KS for CFC (mean±std) and TTS  #
+    # CFC is plotted with mean and standard deviation across splits       #
+    # TTS is plotted as single curve                                       #
     # ---------------------------------------------------------------------#
-    if plots:
-        raw_cfc = {fk: oof["cfc"] for fk, oof in predictions_by_fold.items()}
-        raw_tts = {fk: oof["tts"] for fk, oof in predictions_by_fold.items()}
+    if plots and best_fold_key is not None:
+        best_cfc_df = predictions_by_fold[best_fold_key]["cfc"]
+        best_tts_df = predictions_by_fold[best_fold_key]["tts"]
 
-        cal_cfc: dict = {}
-        cal_tts: dict = {}
-        for fk, art in calibrated_artifacts.items():
-            if art.calibrator is None:
-                continue
-            cfc_df = predictions_by_fold[fk]["cfc"].copy()
-            tts_df = predictions_by_fold[fk]["tts"].copy()
-            cfc_df["score"] = art.calibrator.predict(
-                cfc_df["score"].to_numpy(dtype=float)
-            )
-            tts_df["score"] = art.calibrator.predict(
-                tts_df["score"].to_numpy(dtype=float)
-            )
-            cal_cfc[fk] = cfc_df
-            cal_tts[fk] = tts_df
+        # Apply calibrator if available
+        if best_fold_key in calibrated_artifacts:
+            art = calibrated_artifacts[best_fold_key]
+            if art.calibrator is not None:
+                best_cfc_df = best_cfc_df.copy()
+                best_tts_df = best_tts_df.copy()
+                best_cfc_df["score"] = art.calibrator.predict(
+                    best_cfc_df["score"].to_numpy(dtype=float)
+                )
+                best_tts_df["score"] = art.calibrator.predict(
+                    best_tts_df["score"].to_numpy(dtype=float)
+                )
 
         plot_groups = [
             {
-                "label": "Raw CFC",
+                "label": "CFC (mean±std)",
                 "color": "tab:blue",
                 "linestyle": "-",
-                "preds": raw_cfc,
+                "preds": {best_fold_key: best_cfc_df},
             },
             {
-                "label": "Raw TTS",
+                "label": "TTS",
                 "color": "tab:orange",
                 "linestyle": "-",
-                "preds": raw_tts,
+                "preds": {best_fold_key: best_tts_df},
             },
         ]
-        if cal_cfc:
-            plot_groups.append(
-                {
-                    "label": "Calibrated CFC",
-                    "color": "tab:blue",
-                    "linestyle": "--",
-                    "preds": cal_cfc,
-                },
-            )
-        if cal_tts:
-            plot_groups.append(
-                {
-                    "label": "Calibrated TTS",
-                    "color": "tab:orange",
-                    "linestyle": "--",
-                    "preds": cal_tts,
-                },
-            )
 
         plot_pr_curve_grouped(
             plot_groups,
             plots_dir / f"pr_curve{tag}.pdf",
-            title="PR — Raw vs Calibrated, CFC vs TTS",
+            title=f"PR — Best Model {best_fold_key}",
         )
         plot_roc_curve_grouped(
             plot_groups,
             plots_dir / f"roc_curve{tag}.pdf",
-            title="ROC — Raw vs Calibrated, CFC vs TTS",
+            title=f"ROC — Best Model {best_fold_key}",
         )
         plot_ks_statistic_grouped(
             plot_groups,
             plots_dir / f"ks_statistic{tag}.pdf",
-            title="KS gap — Raw vs Calibrated, CFC vs TTS",
+            title=f"KS Statistic — Best Model {best_fold_key}",
         )
-        plot_calibration_curve_grouped(
-            plot_groups,
-            plots_dir / f"reliability{tag}.pdf",
-            title="Reliability — Raw vs Calibrated, CFC vs TTS",
-        )
-
-        for fold_key, uncal_pipe in uncalibrated_pipeline.items():
-            variants = compute_calibration_variants(
-                uncal_pipe,
-                X,
-                y,
-                sample_weight,
-                random_state=random_state,
-            )
-            plot_calibration_curve(
-                variants,
-                plots_dir / f"calibration_curve_{fold_key}{tag}.pdf",
-                title=f"Calibration plots — {fold_key}",
-            )
 
     n_1 = int((y == 1).sum())
     n_0 = int((y == 0).sum())

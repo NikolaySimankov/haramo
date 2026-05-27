@@ -32,6 +32,8 @@ from sklearn.metrics import (
     get_scorer,
 )
 
+from math import sqrt
+
 import matplotlib.pyplot as plt
 import seaborn as sns
 
@@ -236,7 +238,7 @@ def fn_fp_loss(y_true, y_pred, fp_weight=1.5):
     y_pred = np.asarray(y_pred).astype(int)
     sens = recall_score(y_true, y_pred, average="binary", zero_division=0)
     sel = recall_score(y_true, y_pred, pos_label=0, average="binary", zero_division=0)
-    return float((1.0 - sens) ** 2 + fp_weight * (1.0 - sel) ** 2)
+    return float(sqrt((1.0 - sens) ** 2 + fp_weight * (1.0 - sel) ** 2))
 
 
 # Label-based, so no response_method needed. greater_is_better=False so
