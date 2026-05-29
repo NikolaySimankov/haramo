@@ -1,6 +1,6 @@
 [project]
 name = "haramo"
-version = "0.21.0"
+version = "0.22.0"
 description = "Holistic AutoML-driven Robust Pipeline for Applied Multi-Omics"
 authors = [
     {name = "NikolaySimankov", email = "77026145+NikolaySimankov@users.noreply.github.com"}
