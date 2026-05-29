@@ -146,22 +146,25 @@ if __name__ == "__main__":
 
             for algorithm in ["LGBM"]:
 
+                y = targets[target].dropna()
+                X = {name: X.loc[y.index] for name, X in datasets.items()}
+
                 magic_now(
-                    X=datasets,
+                    X=X,
                     y=y,
-                    outer_cv_groups=groups,
-                    inner_cv_groups=groups,
+                    inner_cv_groups=groups.loc[y.index],
+                    outer_cv_groups=groups.loc[y.index],
                     scoring="FNFP",
                     algorithm=algorithm,
                     scaler="robust",
                     feature_selector="pvalue",
                     hyperparameters="optimize",
+                    pos_weight_factor=1.2,
                     n_trials=10,
-                    output_dir=output_dir,
-                    plots=True,
-                    tag=f"_{protein}_{algorithm}_{target}",
-                    n_jobs=12,
                     calibration="auto",
                     optimize_threshold=True,
-                    pos_weight_factor=1.2,
+                    output_dir=output_dir,
+                    tag=f"_{protein}_{algorithm}_{target}",
+                    plots=True,
+                    n_jobs=12,
                 )

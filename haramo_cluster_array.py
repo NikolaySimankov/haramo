@@ -52,7 +52,7 @@ def get_parser():
 
     parser.add_argument(
         "--t",
-        default=50,
+        default=250,
         type=int,
         dest="n_trials",
         help="number of trials for the hyperparameter optimization process",
@@ -73,7 +73,7 @@ def get_parser():
         default="slurm",
         type=str,
         dest="backend",
-        help="backend to use for the parallelization of the jobs slurm, async or dummy",
+        help="backend to use for the parallelization of the jobs",
         required=True,
     )
 
@@ -107,27 +107,26 @@ if __name__ == "__main__":
     logs.mkdir(exist_ok=True)
 
     jobs = []
-
     # Load the target file into a DataFrame
     all_targets = pd.read_csv(
         data / "host_species_confidence.tsv", sep="\t", index_col="Virus_Species"
     )
 
     target_counts = all_targets.sum(skipna=True)
-    consistent_targets = target_counts[target_counts >= 12].index
+    consistent_targets = target_counts[target_counts >= 24].index
     all_targets = all_targets[consistent_targets]
     all_targets.reset_index(inplace=True)
 
     # Load the feature DataFrames
     feature_files = {
-        # "ctd": "X_ctd.tsv",
+        "ctd": "X_ctd.tsv",
         "ctdc": "X_ctdc.tsv",
         "ctdt": "X_ctdt.tsv",
         "ctdd": "X_ctdd.tsv",
-        # "aac": "X_aac.tsv",
-        "b2b": "X_b2btools.tsv",
-        "nsp": "X_netsurfp.tsv",
-        # "residue": "X_residue.tsv",
+        #        "aac": "X_aac.tsv",
+        #        "b2b": "X_b2btools.tsv",
+        "NSP": "X_netsurfp.tsv",
+        "residue": "X_residue.tsv",
         "biophys": "X_biophys.tsv",
         "class": "X_class.tsv",
     }
@@ -165,6 +164,8 @@ if __name__ == "__main__":
         "Glycoprotein",
     ]
 
+    algos = ["LGBM", "CatB", "XGB", "MLP"]
+
     for protein in proteins:
 
         # forbid matches where the phrase is followed by another word (e.g. "... complex")
@@ -196,52 +197,72 @@ if __name__ == "__main__":
             )
             consistant_targets = prot_counts[prot_counts >= 100].index
 
-            kwargs_heavy = {"cpus": 12, "ram": "48GB", "time": "08:00:00"}
+            kwargs_heavy = {"cpus": 12, "ram": "64GB", "time": "12:00:00"}
 
-            @job(name=f"{args.folder}:{protein}_sp100", **kwargs_heavy)
-            def optimisation():
+            for algorithm in algos:
 
-                for target in consistant_targets:
-                    try:
-                        log_path = logs / f"{args.folder}_{protein}_{target}.log"
-                        if not os.path.exists(log_path):
-                            y = targets[target].dropna()
-                            groups = groups.loc[y.index]
-                            datasets = {
-                                name: X.loc[y.index] for name, X in datasets.items()
-                            }
+                consistant_targets = [
+                    target
+                    for target in consistant_targets
+                    if not os.path.exists(
+                        logs / f"{args.folder}_{protein}_{algorithm}_{target}.log"
+                    )
+                ]
 
-                            magic_now(
-                                X=datasets,
-                                y=y,
-                                outer_cv_groups=groups,
-                                inner_cv_groups=groups,
-                                scoring=mcc_scorer,
-                                algorithm=["LGBM", "XGB"],
-                                scaler="robust",
-                                feature_selector="optimize",
-                                hyperparameters="optimize",
-                                n_trials=args.n_trials,
-                                output_dir=output_dir,
-                                tag=f"_{protein}_{target}",
-                                n_jobs=12,
-                            )
+                if not consistant_targets:
+                    continue
 
-                            with open(log_path, "w") as file:
-                                file.write("done")
+                @job(
+                    name=f"Opti {args.folder}: {protein}_{algorithm}_sp100",
+                    array=len(consistant_targets),
+                    array_throttle=5,
+                    **kwargs_heavy,
+                )
+                def optimisation(i: int):
+                    target = consistant_targets[i]
+                    #                    try:
 
-                    except Exception as e:
-                        pass
+                    log_path = (
+                        logs / f"{args.folder}_{protein}_{algorithm}_{target}.log"
+                    )
+                    if not os.path.exists(log_path):
+                        y = targets[target].dropna()
+                        X = {name: X.loc[y.index] for name, X in datasets.items()}
 
-            jobs.append(optimisation)
+                        magic_now(
+                            X=X,
+                            y=y,
+                            inner_cv_groups=groups.loc[y.index],
+                            outer_cv_groups=groups.loc[y.index],
+                            scoring="FNFP",
+                            algorithm=algorithm,
+                            scaler="robust",
+                            feature_selector="optimize",
+                            hyperparameters="optimize",
+                            pos_weight_factor=1.2,
+                            n_trials=args.n_trials,
+                            calibration="auto",
+                            optimize_threshold=True,
+                            output_dir=output_dir,
+                            tag=f"_{protein}_{algorithm}_{target}",
+                            plots=True,
+                            n_jobs=12,
+                        )
+
+                        with open(log_path, "w") as file:
+                            file.write("done")
+
+                #                    except Exception as e:
+                #                        pass
+
+                jobs.append(optimisation)
 
     schedule(
         *jobs,
         name="Haramo4PredOmics",
         backend=args.backend,
-        # prune=True,
+        prune=True,
         env=[
-            "source ~/.bashrc",
-            "conda activate tabml",
+            "source ~/tabml/bin/activate",
         ],
     )
